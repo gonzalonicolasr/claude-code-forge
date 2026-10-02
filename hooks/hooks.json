@@ -1,0 +1,4 @@
+{
+  "description": "forge",
+  "modules": ["./register.ts"]
+}

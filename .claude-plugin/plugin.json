@@ -1,0 +1,6 @@
+{
+  "name": "forge",
+  "version": "0.3.0",
+  "description": "SDD estilo zero-pi dentro de Claude Code, con un modelo del CPAM por fase",
+  "author": { "name": "Gonzalo Rocca" }
+}
