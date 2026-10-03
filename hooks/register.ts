@@ -32,6 +32,8 @@ import {
   parseDecision,
   parseClarifyStatus,
   pickAnswer,
+  modelUnavailable,
+  DEFAULT_FALLBACK,
   forgeMayRun,
   section,
   parseTasks,
@@ -198,6 +200,8 @@ const stepTexts = new Map<string, string[]>()
 const handbacks = new Map<string, string>()
 const autoAgents = new Set<string>()
 const cpamCalls = new Map<string, string>()
+const unavailable = new Map<string, number>()
+let fallbackModel = DEFAULT_FALLBACK
 const HANDBACK_TOOL = {
   name: 'SubagentHandback',
   description: 'Deliver your final report to your caller. The call ends your run, so make it your last step: put your whole report in message.',
@@ -238,6 +242,12 @@ async function loadConfig($: any) {
     excluded = Array.isArray(ex) ? ex.filter((x) => typeof x === 'string' && x) : []
   } catch {
     excluded = []
+  }
+  try {
+    const fb = JSON.parse(String((home ? await $.fs.read(`${home}/.config/forge/fallback.json`).catch(() => '') : '') || '{}'))
+    fallbackModel = typeof fb.model === 'string' && fb.model ? fb.model : DEFAULT_FALLBACK
+  } catch {
+    fallbackModel = DEFAULT_FALLBACK
   }
   const zeroRaw = home ? await $.fs.read(`${home}/.pi/zero.json`).catch(() => '') : ''
   let zero: any = {}
@@ -1185,15 +1195,26 @@ export function register(on: any) {
     const found = await $.session.messages({ agentId: e.agentId, as: 'api' }).catch((err: any) => ({ deny: String(err) }))
     const cwd = run?.cwd || (await $.session.cwd().catch(() => ''))
     const fail = (why: string) => ({ error: why })
-    const got: any = Array.isArray(found)
-      ? await callCpam($, {
-          model: cpamModel(route.model, effort),
-          max_tokens: 32000,
-          system: `${PHASE_PROMPTS[phase]}\n\nEnvironment: working directory ${cwd}; platform linux; date ${new Date().toISOString().slice(0, 10)}.`,
-          tools: [...PHASE_TOOLS[phase].filter((name) => name !== 'Glob' && name !== 'Grep').map((name) => ({ name, ...TOOLS[name] })), ...(autoAgents.has(e.agentId) ? [HANDBACK_TOOL] : [])],
-          messages: cleanMessages(found, thinking),
-        })
-      : fail(`no pude leer la conversación del agente: ${found.deny}`)
+    const ask = (m: string) =>
+      callCpam($, {
+        model: cpamModel(m, m === route.model || !effortBlocked(m) ? effort : undefined),
+        max_tokens: 32000,
+        system: `${PHASE_PROMPTS[phase]}\n\nEnvironment: working directory ${cwd}; platform linux; date ${new Date().toISOString().slice(0, 10)}.`,
+        tools: [...PHASE_TOOLS[phase].filter((name) => name !== 'Glob' && name !== 'Grep').map((name) => ({ name, ...TOOLS[name] })), ...(autoAgents.has(e.agentId) ? [HANDBACK_TOOL] : [])],
+        messages: cleanMessages(found, thinking),
+      })
+    const down = (m: string) => now() - (unavailable.get(m) || 0) < 30 * 60000
+    let got: any
+    if (!Array.isArray(found)) got = fail(`no pude leer la conversación del agente: ${found.deny}`)
+    else if (down(route.model) && fallbackModel !== route.model) got = await ask(fallbackModel)
+    else {
+      got = await ask(route.model)
+      if (got.error && modelUnavailable(got.error) && fallbackModel !== route.model) {
+        unavailable.set(route.model, now())
+        if (run) run.routing.push(`${stamp()} ${phase} · ${route.model} no está disponible en el CPAM (${String(got.error).slice(0, 120)}) → sigue con ${fallbackModel} por 30 min`)
+        got = await ask(fallbackModel)
+      }
+    }
     if (got.error) {
       if (st && run) run.routing.push(`${stamp()} ${phase} paso ${e.index} · CPAM ${route.model} · ERROR ${got.error}`)
       void persist($)

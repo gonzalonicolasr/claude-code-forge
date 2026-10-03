@@ -168,6 +168,12 @@ export function phaseAnswerOk(phase: Phase, text: string): boolean {
   return t.length >= 40
 }
 
+export const DEFAULT_FALLBACK = 'ag/gemini-pro-agent'
+
+export function modelUnavailable(error: string): boolean {
+  return /HTTP 40[04]\b/.test(error) && /not supported|not found|does not exist|unknown model|no such model|model_not_found|unsupported model/i.test(error)
+}
+
 export function forgeMayRun(tool: string, input: unknown, cwd: string, dir: string): boolean {
   const i = (input || {}) as Record<string, unknown>
   if (['Read', 'Glob', 'Grep', 'Bash'].includes(tool)) return true

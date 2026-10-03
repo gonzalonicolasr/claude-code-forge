@@ -1,5 +1,5 @@
 import { expect, test, describe, mock } from 'claude-code/testing'
-import { routeFor, phaseOfAgentType, parseVerdict, advance, slugify, parseStart, modelCatalog, groupOf, cleanMessages, thinkingByTool, stateSnapshot, exportStatus, DEFAULT_PROFILES, DEFAULT_EFFORTS, BUILTIN_PROFILES, cpamModel, claudeEffort, compareModels, zeroProfiles, isExcluded, effortBlocked, groupLabel, PHASES, phaseOrder, parseDecision, parseClarifyStatus, pickAnswer, forgeMayRun, section, parseTasks, validateTasks, buildBatches } from './logic.ts'
+import { routeFor, phaseOfAgentType, parseVerdict, advance, slugify, parseStart, modelCatalog, groupOf, cleanMessages, thinkingByTool, stateSnapshot, exportStatus, DEFAULT_PROFILES, DEFAULT_EFFORTS, BUILTIN_PROFILES, cpamModel, claudeEffort, compareModels, zeroProfiles, isExcluded, effortBlocked, groupLabel, PHASES, phaseOrder, parseDecision, parseClarifyStatus, pickAnswer, forgeMayRun, modelUnavailable, section, parseTasks, validateTasks, buildBatches } from './logic.ts'
 
 describe('ruteo', () => {
   test('los tipos forge:<fase> se reconocen y el resto no', () => {
@@ -185,6 +185,14 @@ describe('gates y tareas', () => {
     expect(parseClarifyStatus('## Status\n**blocked**\n## Blocking questions\n- ¿A o B?')).toBe('blocked')
     expect(parseClarifyStatus('Status: `continue`')).toBe('continue')
     expect(parseClarifyStatus('sin estado')).toBe(undefined)
+  })
+
+  test('reconoce cuando el CPAM dice que un modelo no está disponible, y nada más', () => {
+    expect(modelUnavailable(`HTTP 400: {"detail":"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}`)).toBe(true)
+    expect(modelUnavailable('HTTP 404: model_not_found')).toBe(true)
+    expect(modelUnavailable('HTTP 429: usage_limit_reached')).toBe(false)
+    expect(modelUnavailable('HTTP 400: max_tokens is too large')).toBe(false)
+    expect(modelUnavailable('HTTP 0: aborted')).toBe(false)
   })
 
   test('forge sólo deja correr sin clasificador lo de su fase: lecturas, bash y escrituras dentro del proyecto', () => {
