@@ -194,6 +194,13 @@ let stateDirReady = false
 const agentPhase = new Map<string, Phase>()
 const answers = new Map<string, string>()
 const stepTexts = new Map<string, string[]>()
+const handbacks = new Map<string, string>()
+const autoAgents = new Set<string>()
+const HANDBACK_TOOL = {
+  name: 'SubagentHandback',
+  description: 'Deliver your final report to your caller. The call ends your run, so make it your last step: put your whole report in message.',
+  input_schema: { type: 'object', properties: { message: { type: 'string', description: 'your full report' } }, required: ['message'] },
+}
 const thinking = new Map<string, any[]>()
 
 const now = () => Date.now()
@@ -604,17 +611,24 @@ async function phaseOf($: any, agentId: string): Promise<Phase | undefined> {
   return phase
 }
 
+async function postCpam($: any, body: any): Promise<{ ok: boolean; status: number; text: string }> {
+  const script = 'curl -sS -H @<(printf "x-api-key: %s\\n" "$(cat "$1")") -H "anthropic-version: 2023-06-01" -H "content-type: application/json" --max-time 590 -w "\\n%{http_code}" --data-binary @- "$2"'
+  try {
+    const r = await $.process.run(['bash', '-c', script, 'forge', `${home}/.config/cli-proxy-api/api-key.txt`, `${CPAM}/v1/messages`], { stdin: JSON.stringify(body), timeoutMs: 600000 })
+    const out = String(r.stdout || '')
+    const cut = out.lastIndexOf('\n')
+    const status = Number(out.slice(cut + 1)) || 0
+    return { ok: status >= 200 && status < 300, status, text: status ? out.slice(0, cut) : String(r.stderr || out).slice(0, 300) }
+  } catch (err: any) {
+    return { ok: false, status: 0, text: String(err) }
+  }
+}
+
 async function callCpam($: any, body: any) {
   let last = ''
   for (let attempt = 0; attempt < 3; attempt++) {
     if (attempt) await $.clock.sleep(2000 * attempt)
-    const res = await $.http
-      .fetch(`${CPAM}/v1/messages`, {
-        method: 'POST',
-        headers: { 'x-api-key': cpamKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-        body: JSON.stringify(body),
-      })
-      .catch((err: any) => ({ ok: false, status: 0, text: String(err) }))
+    const res = await postCpam($, body)
     if (res.ok) {
       try {
         return { data: JSON.parse(res.text) }
@@ -634,8 +648,12 @@ async function finishPhase($: any, phase: Phase, agentId: string | undefined, co
   const st = run.stats[phase]
   st.ms = now() - st.startedAt
   const fromContent = Array.isArray(content) ? content.filter((b: any) => b.type === 'text').map((b: any) => b.text).join('\n') : ''
-  const answer = pickAnswer(phase, String((agentId && answers.get(agentId)) || fromContent || ''), (agentId && stepTexts.get(agentId)) || [])
-  if (agentId) stepTexts.delete(agentId)
+  const answer = pickAnswer(phase, String((agentId && (handbacks.get(agentId) || answers.get(agentId))) || fromContent || ''), (agentId && stepTexts.get(agentId)) || [])
+  if (agentId) {
+    stepTexts.delete(agentId)
+    handbacks.delete(agentId)
+    autoAgents.delete(agentId)
+  }
   const cpamFailed = answer.startsWith('FORGE_CPAM_ERROR')
   const round = run.verdicts.length + 1
   const batch = phase === 'build' && run.batches ? { index: run.batchIdx, total: run.batches.length } : undefined
@@ -1035,7 +1053,9 @@ export function register(on: any) {
   on('agent.spawn', async ($: any, e: any, next: any) => {
     if (!phaseOfAgentType(e.subagentType) || run?.status !== 'running') return next(e)
     if (e.background) run.routing.push(`${stamp()} ${e.subagentType} venía en segundo plano; forge lo pide en primer plano`)
-    return next({ ...e, background: false })
+    const r = await next({ ...e, background: false })
+    if (e.permissionMode === 'auto' && r?.agentId) autoAgents.add(r.agentId)
+    return r
   })
 
   on('agent.offer', async ($: any, e: any, next: any) => {
@@ -1157,7 +1177,7 @@ export function register(on: any) {
           model: cpamModel(route.model, effort),
           max_tokens: 32000,
           system: `${PHASE_PROMPTS[phase]}\n\nEnvironment: working directory ${cwd}; platform linux; date ${new Date().toISOString().slice(0, 10)}.`,
-          tools: PHASE_TOOLS[phase].map((name) => ({ name, ...TOOLS[name] })),
+          tools: [...PHASE_TOOLS[phase].map((name) => ({ name, ...TOOLS[name] })), ...(autoAgents.has(e.agentId) ? [HANDBACK_TOOL] : [])],
           messages: cleanMessages(found, thinking),
         })
       : fail(`no pude leer la conversación del agente: ${found.deny}`)
@@ -1181,6 +1201,7 @@ export function register(on: any) {
         answer += b.text
         yield { kind: 'text', index: i, text: b.text }
       } else if (b.type === 'tool_use') {
+        if (b.name === HANDBACK_TOOL.name && typeof b.input?.message === 'string') handbacks.set(e.agentId, b.input.message)
         toolUses.push({ name: b.name, input: b.input ?? {} })
         yield { kind: 'tool', index: i, id: b.id, name: b.name }
         yield { kind: 'input', index: i, json: JSON.stringify(b.input ?? {}) }

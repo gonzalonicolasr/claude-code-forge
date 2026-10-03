@@ -161,6 +161,7 @@ export function parseClarifyStatus(text: string): 'continue' | 'blocked' | undef
 
 export function phaseAnswerOk(phase: Phase, text: string): boolean {
   const t = String(text || '').trim()
+  if (/\bSubagentHandback\b/.test(t)) return false
   if (phase === 'clarify') return t.length >= 40 && parseClarifyStatus(t) !== undefined
   if (phase === 'analyze') return parseDecision(t) !== undefined
   if (phase === 'veredicto') return parseVerdict(t) !== undefined

@@ -193,6 +193,8 @@ describe('gates y tareas', () => {
     expect(pickAnswer('clarify', good, ['otro'])).toBe(good)
     expect(pickAnswer('clarify', 'nada', ['tampoco'])).toBe('nada')
     expect(pickAnswer('veredicto', 'fin', ['## Veredicto\npasa'])).toBe('## Veredicto\npasa')
+    const queja = '`SubagentHandback` is not available among the tools in this session, so I can’t call it. The exploration report was delivered above.'
+    expect(pickAnswer('explore', queja, ['## Hallazgos\n- recall híbrido mezcla puntajes sin normalizar'])).toBe('## Hallazgos\n- recall híbrido mezcla puntajes sin normalizar')
     expect(pickAnswer('explore', 'ok', ['## Hallazgos\n- el índice no se reconstruye al borrar'])).toBe('## Hallazgos\n- el índice no se reconstruye al borrar')
     expect(parseDecision('## Decision\nDecision: replan')).toBe('replan')
     expect(parseDecision('**Decision:** `continue`')).toBe('continue')
