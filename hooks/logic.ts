@@ -170,7 +170,7 @@ export function phaseAnswerOk(phase: Phase, text: string): boolean {
 
 export function forgeMayRun(tool: string, input: unknown, cwd: string, dir: string): boolean {
   const i = (input || {}) as Record<string, unknown>
-  if (['Read', 'Glob', 'Grep', 'Bash', 'SubagentHandback'].includes(tool)) return true
+  if (['Read', 'Glob', 'Grep', 'Bash'].includes(tool)) return true
   if (!['Write', 'Edit', 'MultiEdit', 'NotebookEdit'].includes(tool)) return false
   const path = String(i.file_path ?? i.notebook_path ?? '')
   const inside = (root: string) => !!root && (path === root || path.startsWith(root.endsWith('/') ? root : `${root}/`))

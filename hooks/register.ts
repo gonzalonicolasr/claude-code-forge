@@ -1190,7 +1190,7 @@ export function register(on: any) {
           model: cpamModel(route.model, effort),
           max_tokens: 32000,
           system: `${PHASE_PROMPTS[phase]}\n\nEnvironment: working directory ${cwd}; platform linux; date ${new Date().toISOString().slice(0, 10)}.`,
-          tools: [...PHASE_TOOLS[phase].map((name) => ({ name, ...TOOLS[name] })), ...(autoAgents.has(e.agentId) ? [HANDBACK_TOOL] : [])],
+          tools: [...PHASE_TOOLS[phase].filter((name) => name !== 'Glob' && name !== 'Grep').map((name) => ({ name, ...TOOLS[name] })), ...(autoAgents.has(e.agentId) ? [HANDBACK_TOOL] : [])],
           messages: cleanMessages(found, thinking),
         })
       : fail(`no pude leer la conversación del agente: ${found.deny}`)

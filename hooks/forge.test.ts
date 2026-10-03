@@ -197,6 +197,7 @@ describe('gates y tareas', () => {
     expect(forgeMayRun('Write', { file_path: 'lib.js' }, cwd, dir)).toBe(false)
     expect(forgeMayRun('Bash', { command: 'npm test' }, cwd, dir)).toBe(true)
     expect(forgeMayRun('WebFetch', { url: 'https://x' }, cwd, dir)).toBe(false)
+    expect(forgeMayRun('SubagentHandback', { message: 'informe' }, cwd, dir)).toBe(false)
   })
 
   test('si el mensaje final de una fase viene vacío de formato, se usa el último paso que lo trae', () => {
