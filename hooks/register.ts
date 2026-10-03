@@ -370,6 +370,29 @@ async function recentRunDir($: any): Promise<string | undefined> {
 }
 
 let restoreTriedAt = 0
+let sessionId = ''
+let inboxSeen = ''
+let inboxBusy = false
+
+async function checkInbox($: any) {
+  if (inboxBusy || !home || !sessionId) return
+  inboxBusy = true
+  try {
+    const path = `${home}/.local/state/forge/inbox-${sessionId}.json`
+    const raw = await $.fs.read(path).catch(() => '')
+    if (!raw) return
+    const msg = JSON.parse(String(raw))
+    if (!msg?.id || msg.id === inboxSeen || msg.done) return
+    inboxSeen = msg.id
+    if (!msg.at || now() - Number(msg.at) > 30000) return
+    const text = await commandText($, String(msg.args || ''))
+    await $.fs.write(path, JSON.stringify({ ...msg, done: true, text: text ?? '' }) + '\n').catch(() => undefined)
+    $.ui.invalidate('ui.render')
+  } catch {
+  } finally {
+    inboxBusy = false
+  }
+}
 
 async function restoreRun($: any, agentId?: string) {
   if (run || (!agentId && now() - restoreTriedAt < 30000)) return
@@ -1008,8 +1031,10 @@ export function register(on: any) {
         })
         .catch((err: any) => $.ui.log(`forge: /forge no registrado: ${err}`, { to: 'debug' }))
     void fetchModels($)
+    sessionId = await $.session.id().catch(() => '')
     $.clock.every(120, () => {
       frame++
+      if (frame % 3 === 0) void checkInbox($)
       if (paneOpen && run?.status === 'running') $.ui.invalidate('ui.render')
     })
     return r
