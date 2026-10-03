@@ -373,6 +373,28 @@ let restoreTriedAt = 0
 let sessionId = ''
 let inboxSeen = ''
 let inboxBusy = false
+let syncBusy = false
+
+async function syncConfig($: any) {
+  if (syncBusy) return
+  syncBusy = true
+  try {
+    const saved: any = await $.store.get('config').catch(() => undefined)
+    if (!saved || typeof saved !== 'object') return
+    const next = {
+      ...config,
+      ...saved,
+      models: fillPhases({ ...config.models, ...(saved.models || {}) }),
+      efforts: { ...AUTO_EFFORTS, ...(saved.efforts || {}) },
+      skip: Array.isArray(saved.skip) ? saved.skip.filter((p: Phase) => OPTIONAL_PHASES.includes(p)) : [],
+    }
+    if (JSON.stringify(next) === JSON.stringify(config)) return
+    config = next
+    $.ui.invalidate('ui.render')
+  } finally {
+    syncBusy = false
+  }
+}
 
 async function checkInbox($: any) {
   if (inboxBusy || !home || !sessionId) return
@@ -1035,6 +1057,7 @@ export function register(on: any) {
     $.clock.every(120, () => {
       frame++
       if (frame % 3 === 0) void checkInbox($)
+      if (frame % 8 === 4) void syncConfig($)
       if (paneOpen && run?.status === 'running') $.ui.invalidate('ui.render')
     })
     return r
