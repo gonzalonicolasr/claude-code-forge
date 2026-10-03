@@ -168,6 +168,15 @@ export function phaseAnswerOk(phase: Phase, text: string): boolean {
   return t.length >= 40
 }
 
+export function forgeMayRun(tool: string, input: unknown, cwd: string, dir: string): boolean {
+  const i = (input || {}) as Record<string, unknown>
+  if (['Read', 'Glob', 'Grep', 'Bash', 'SubagentHandback'].includes(tool)) return true
+  if (!['Write', 'Edit', 'MultiEdit', 'NotebookEdit'].includes(tool)) return false
+  const path = String(i.file_path ?? i.notebook_path ?? '')
+  const inside = (root: string) => !!root && (path === root || path.startsWith(root.endsWith('/') ? root : `${root}/`))
+  return path.startsWith('/') && !path.split('/').includes('..') && (inside(cwd) || inside(dir))
+}
+
 export function pickAnswer(phase: Phase, final: string, steps: readonly string[]): string {
   if (phaseAnswerOk(phase, final)) return final
   for (let i = steps.length - 1; i >= 0; i--) if (phaseAnswerOk(phase, steps[i]!)) return steps[i]!

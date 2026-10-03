@@ -32,6 +32,7 @@ import {
   parseDecision,
   parseClarifyStatus,
   pickAnswer,
+  forgeMayRun,
   section,
   parseTasks,
   validateTasks,
@@ -196,6 +197,7 @@ const answers = new Map<string, string>()
 const stepTexts = new Map<string, string[]>()
 const handbacks = new Map<string, string>()
 const autoAgents = new Set<string>()
+const cpamCalls = new Map<string, string>()
 const HANDBACK_TOOL = {
   name: 'SubagentHandback',
   description: 'Deliver your final report to your caller. The call ends your run, so make it your last step: put your whole report in message.',
@@ -1058,6 +1060,17 @@ export function register(on: any) {
     return r
   })
 
+  on('tool.check', async ($: any, e: any, next: any) => {
+    const r = await next(e)
+    const agentId = e.tool_use_id ? cpamCalls.get(e.tool_use_id) : undefined
+    if (!agentId) return r
+    cpamCalls.delete(e.tool_use_id)
+    if (!run || run.status !== 'running' || !forgeMayRun(e.tool, e.input, run.cwd, run.dir)) return r
+    if (r?.decision === 'allow' || r?.rule) return r
+    if (r?.decision === 'deny' && !/classifier|auto mode/i.test(String(r.reason || ''))) return r
+    return { decision: 'allow', reason: 'forge: fase servida por el CPAM, sin clasificador del modo auto' }
+  })
+
   on('agent.offer', async ($: any, e: any, next: any) => {
     if (phaseOfAgentType(e.agent) && run?.status !== 'running') return { isOffered: false }
     return next(e)
@@ -1202,6 +1215,7 @@ export function register(on: any) {
         yield { kind: 'text', index: i, text: b.text }
       } else if (b.type === 'tool_use') {
         if (b.name === HANDBACK_TOOL.name && typeof b.input?.message === 'string') handbacks.set(e.agentId, b.input.message)
+        if (b.id) cpamCalls.set(b.id, e.agentId)
         toolUses.push({ name: b.name, input: b.input ?? {} })
         yield { kind: 'tool', index: i, id: b.id, name: b.name }
         yield { kind: 'input', index: i, json: JSON.stringify(b.input ?? {}) }

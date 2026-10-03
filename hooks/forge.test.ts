@@ -1,5 +1,5 @@
 import { expect, test, describe, mock } from 'claude-code/testing'
-import { routeFor, phaseOfAgentType, parseVerdict, advance, slugify, parseStart, modelCatalog, groupOf, cleanMessages, thinkingByTool, stateSnapshot, exportStatus, DEFAULT_PROFILES, DEFAULT_EFFORTS, BUILTIN_PROFILES, cpamModel, claudeEffort, compareModels, zeroProfiles, isExcluded, effortBlocked, groupLabel, PHASES, phaseOrder, parseDecision, parseClarifyStatus, pickAnswer, section, parseTasks, validateTasks, buildBatches } from './logic.ts'
+import { routeFor, phaseOfAgentType, parseVerdict, advance, slugify, parseStart, modelCatalog, groupOf, cleanMessages, thinkingByTool, stateSnapshot, exportStatus, DEFAULT_PROFILES, DEFAULT_EFFORTS, BUILTIN_PROFILES, cpamModel, claudeEffort, compareModels, zeroProfiles, isExcluded, effortBlocked, groupLabel, PHASES, phaseOrder, parseDecision, parseClarifyStatus, pickAnswer, forgeMayRun, section, parseTasks, validateTasks, buildBatches } from './logic.ts'
 
 describe('ruteo', () => {
   test('los tipos forge:<fase> se reconocen y el resto no', () => {
@@ -185,6 +185,18 @@ describe('gates y tareas', () => {
     expect(parseClarifyStatus('## Status\n**blocked**\n## Blocking questions\n- ¿A o B?')).toBe('blocked')
     expect(parseClarifyStatus('Status: `continue`')).toBe('continue')
     expect(parseClarifyStatus('sin estado')).toBe(undefined)
+  })
+
+  test('forge sólo deja correr sin clasificador lo de su fase: lecturas, bash y escrituras dentro del proyecto', () => {
+    const cwd = '/home/g/toy', dir = '/home/g/toy/.sdd/x'
+    expect(forgeMayRun('Write', { file_path: '/home/g/toy/.sdd/x/plan.md' }, cwd, dir)).toBe(true)
+    expect(forgeMayRun('Edit', { file_path: '/home/g/toy/lib.js' }, cwd, dir)).toBe(true)
+    expect(forgeMayRun('Write', { file_path: '/home/g/.bashrc' }, cwd, dir)).toBe(false)
+    expect(forgeMayRun('Write', { file_path: '/home/g/toy/../.bashrc' }, cwd, dir)).toBe(false)
+    expect(forgeMayRun('Write', { file_path: '/home/g/toyota/a' }, cwd, dir)).toBe(false)
+    expect(forgeMayRun('Write', { file_path: 'lib.js' }, cwd, dir)).toBe(false)
+    expect(forgeMayRun('Bash', { command: 'npm test' }, cwd, dir)).toBe(true)
+    expect(forgeMayRun('WebFetch', { url: 'https://x' }, cwd, dir)).toBe(false)
   })
 
   test('si el mensaje final de una fase viene vacío de formato, se usa el último paso que lo trae', () => {
