@@ -35,12 +35,12 @@ export const DEFAULT_PROFILES: Record<string, Record<Phase, string>> = {
     plan: 'ag3/gemini-3.7-flash-high',
     analyze: 'prolite/gpt-6-luna',
     build: 'ag3/gemini-3.7-flash-high',
-    veredicto: 'prolite/gpt-6.1-sol',
+    veredicto: 'prolite/gpt-6-sol',
   },
   equilibrado: {
     clarify: 'ag3/gemini-3.7-flash-high',
     explore: 'ag3/gemini-3.7-flash-high',
-    plan: 'prolite/gpt-6.1-sol',
+    plan: 'prolite/gpt-6-sol',
     analyze: 'prolite/gpt-6-luna',
     build: 'prolite/gpt-6-luna',
     veredicto: 'sonnet',
@@ -48,9 +48,9 @@ export const DEFAULT_PROFILES: Record<string, Record<Phase, string>> = {
   calidad: {
     clarify: 'ag3/gemini-3.8-flash-high',
     explore: 'ag3/gemini-3.8-flash-high',
-    plan: 'prolite/gpt-6.1-sol',
+    plan: 'prolite/gpt-6-sol',
     analyze: 'prolite/gpt-6-astra',
-    build: 'prolite/gpt-6.1-sol',
+    build: 'prolite/gpt-6-sol',
     veredicto: 'opus',
   },
   'open-source': {
@@ -72,9 +72,9 @@ export const DEFAULT_PROFILES: Record<string, Record<Phase, string>> = {
   openai: {
     clarify: 'prolite/gpt-6-luna',
     explore: 'prolite/gpt-6-luna',
-    plan: 'prolite/gpt-6.1-sol',
-    analyze: 'prolite/gpt-6.1-sol',
-    build: 'prolite/gpt-6.1-sol',
+    plan: 'prolite/gpt-6-sol',
+    analyze: 'prolite/gpt-6-sol',
+    build: 'prolite/gpt-6-sol',
     veredicto: 'prolite/gpt-6-astra',
   },
   'solo-claude': {
