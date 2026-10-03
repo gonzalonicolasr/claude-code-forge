@@ -31,6 +31,7 @@ import {
   REPLAN_CAP,
   parseDecision,
   parseClarifyStatus,
+  pickAnswer,
   section,
   parseTasks,
   validateTasks,
@@ -167,6 +168,7 @@ type Run = {
   awaitTurn: boolean
   inFlight?: string
   asyncSeen: boolean
+  owner?: string
 }
 type Config = { mode: 'preguntar' | Mode; cap: number; profile: string; models: Record<Phase, string>; efforts: Record<Phase, Effort>; skip: Phase[] }
 
@@ -191,6 +193,7 @@ let asking = false
 let stateDirReady = false
 const agentPhase = new Map<string, Phase>()
 const answers = new Map<string, string>()
+const stepTexts = new Map<string, string[]>()
 const thinking = new Map<string, any[]>()
 
 const now = () => Date.now()
@@ -336,9 +339,42 @@ async function fetchModels($: any) {
   $.ui.invalidate('ui.render')
 }
 
+async function recentRunDir($: any): Promise<string | undefined> {
+  const cwd = await $.session.cwd().catch(() => '')
+  if (!cwd) return undefined
+  const runs: { dir: string; at: number }[] = []
+  for (const d of ((await $.fs.list(`${cwd}/.sdd`).catch(() => [])) as any[]).filter((x: any) => x.kind === 'dir')) {
+    const st: any = await $.fs.stat(`${cwd}/.sdd/${d.name}/run.json`).catch(() => undefined)
+    if (st?.mtimeMs && now() - st.mtimeMs < 15 * 60000) runs.push({ dir: `${cwd}/.sdd/${d.name}`, at: st.mtimeMs })
+  }
+  return runs.sort((a, b) => b.at - a.at)[0]?.dir
+}
+
+let restoreTriedAt = 0
+
+async function restoreRun($: any, agentId?: string) {
+  if (run || (!agentId && now() - restoreTriedAt < 30000)) return
+  if (!agentId) restoreTriedAt = now()
+  let dir = await $.store.get('activeRun').catch(() => undefined)
+  if (typeof dir !== 'string' || !dir) dir = await recentRunDir($)
+  if (typeof dir !== 'string' || !dir) return
+  try {
+    const saved = JSON.parse(String((await $.fs.read(`${dir}/run.json`).catch(() => '')) || ''))
+    if (!saved || saved.status !== 'running' || run) return
+    const sid = await $.session.id().catch(() => '')
+    if (!(saved.owner && saved.owner === sid) && !(agentId && saved.inFlight === agentId)) return
+    const log = String((await $.fs.read(`${dir}/routing.log`).catch(() => '')) || '')
+    run = { ...saved, routing: [...log.split('\n').filter(Boolean), `${stamp()} forge se recargó a mitad del run; sigue desde ${saved.phase || 'la fase en curso'}`] }
+    await exportState($)
+    $.ui.invalidate('ui.render')
+  } catch {}
+}
+
 async function persist($: any) {
   await exportState($)
   if (!run) return
+  if (!run.owner) run.owner = await $.session.id().catch(() => undefined)
+  await $.store.set('activeRun', run.status === 'running' ? run.dir : null).catch(() => undefined)
   const { routing, ...rest } = run
   await $.fs.write(`${run.dir}/run.json`, JSON.stringify(rest, null, 2) + '\n').catch(() => undefined)
   await $.fs.write(`${run.dir}/rounds.json`, JSON.stringify({ cap: run.cap, verdicts: run.verdicts }, null, 2) + '\n').catch(() => undefined)
@@ -598,7 +634,8 @@ async function finishPhase($: any, phase: Phase, agentId: string | undefined, co
   const st = run.stats[phase]
   st.ms = now() - st.startedAt
   const fromContent = Array.isArray(content) ? content.filter((b: any) => b.type === 'text').map((b: any) => b.text).join('\n') : ''
-  const answer = String((agentId && answers.get(agentId)) || fromContent || '')
+  const answer = pickAnswer(phase, String((agentId && answers.get(agentId)) || fromContent || ''), (agentId && stepTexts.get(agentId)) || [])
+  if (agentId) stepTexts.delete(agentId)
   const cpamFailed = answer.startsWith('FORGE_CPAM_ERROR')
   const round = run.verdicts.length + 1
   const batch = phase === 'build' && run.batches ? { index: run.batchIdx, total: run.batches.length } : undefined
@@ -915,6 +952,7 @@ export function register(on: any) {
     headless = (await $.env.get('CLAUDE_CODE_ENTRYPOINT').catch(() => '')) === 'sdk-cli'
     cpamKey = String((await $.fs.read(`${home}/.config/cli-proxy-api/api-key.txt`).catch(() => '')) || '').trim()
     await loadConfig($)
+    await restoreRun($)
     await exportState($)
     for (const p of PHASES) {
       await $.agent
@@ -948,6 +986,7 @@ export function register(on: any) {
   })
 
   on('command.run', { command: 'forge' }, async ($: any, e: any) => {
+    await restoreRun($)
     const args = String(e.args || '').trim()
     const sub = args.split(/\s+/)[0]?.toLowerCase() || ''
     if (!args || sub === 'ui') {
@@ -1084,6 +1123,7 @@ export function register(on: any) {
     if (!e.agentId) return yield* next(e)
     const phase = await phaseOf($, e.agentId)
     if (!phase) return yield* next(e)
+    await restoreRun($, e.agentId)
     if (run && run.status !== 'running') {
       const text = `forge: el run ${run.slug} está ${STATUS_LABEL[run.status]}; esta fase no sigue.`
       const usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, model: 'forge' }
@@ -1103,6 +1143,7 @@ export function register(on: any) {
         st.inTok += (res?.usage?.input_tokens || 0) + (res?.usage?.cache_read_input_tokens || 0) + (res?.usage?.cache_creation_input_tokens || 0)
         st.outTok += res?.usage?.output_tokens || 0
         st.answeredBy = res?.usage?.model || e.model
+        if (res?.answer) stepTexts.set(e.agentId, [...(stepTexts.get(e.agentId) || []), String(res.answer)])
         run.routing.push(`${stamp()} ${phase} paso ${e.index} · Claude Code · effort ${level || 'default'} · respondió ${st.answeredBy} · stop=${res?.stopReason} · in=${res?.usage?.input_tokens || 0} cache=${(res?.usage?.cache_read_input_tokens || 0) + (res?.usage?.cache_creation_input_tokens || 0)} out=${res?.usage?.output_tokens || 0}`)
         void persist($)
       }
@@ -1159,6 +1200,7 @@ export function register(on: any) {
       st.inTok += usage.input_tokens + usage.cache_read_input_tokens
       st.outTok += usage.output_tokens
       st.answeredBy = `${route.model} (${usage.model})`
+      if (answer) stepTexts.set(e.agentId, [...(stepTexts.get(e.agentId) || []), answer])
       run.routing.push(`${stamp()} ${phase} paso ${e.index} · CPAM pedido ${cpamModel(route.model, effort)} · respondió ${usage.model} · stop=${stop} · tools=${toolUses.map((x) => x.name).join(',') || '-'} · in=${usage.input_tokens} cache=${usage.cache_read_input_tokens} out=${usage.output_tokens}`)
       void persist($)
       $.ui.invalidate('ui.render')
@@ -1168,6 +1210,7 @@ export function register(on: any) {
   })
 
   on('turn.complete', async ($: any, e: any, next: any) => {
+    if (e.agentId && (await phaseOf($, e.agentId))) await restoreRun($, e.agentId)
     if (e.agentId) {
       const phase = await phaseOf($, e.agentId)
       if (phase) answers.set(e.agentId, String(e.answer || ''))

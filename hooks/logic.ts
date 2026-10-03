@@ -159,6 +159,20 @@ export function parseClarifyStatus(text: string): 'continue' | 'blocked' | undef
   return m ? (m[1]!.toLowerCase() as 'continue' | 'blocked') : undefined
 }
 
+export function phaseAnswerOk(phase: Phase, text: string): boolean {
+  const t = String(text || '').trim()
+  if (phase === 'clarify') return t.length >= 40 && parseClarifyStatus(t) !== undefined
+  if (phase === 'analyze') return parseDecision(t) !== undefined
+  if (phase === 'veredicto') return parseVerdict(t) !== undefined
+  return t.length >= 40
+}
+
+export function pickAnswer(phase: Phase, final: string, steps: readonly string[]): string {
+  if (phaseAnswerOk(phase, final)) return final
+  for (let i = steps.length - 1; i >= 0; i--) if (phaseAnswerOk(phase, steps[i]!)) return steps[i]!
+  return final
+}
+
 export function section(text: string, title: string): string {
   const lines = String(text || '').split('\n')
   const start = lines.findIndex((l) => new RegExp(`^##\\s+${title}\\b`, 'i').test(l))

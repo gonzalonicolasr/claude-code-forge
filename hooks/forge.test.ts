@@ -1,5 +1,5 @@
 import { expect, test, describe, mock } from 'claude-code/testing'
-import { routeFor, phaseOfAgentType, parseVerdict, advance, slugify, parseStart, modelCatalog, groupOf, cleanMessages, thinkingByTool, stateSnapshot, exportStatus, DEFAULT_PROFILES, DEFAULT_EFFORTS, BUILTIN_PROFILES, cpamModel, claudeEffort, compareModels, zeroProfiles, isExcluded, effortBlocked, groupLabel, PHASES, phaseOrder, parseDecision, parseClarifyStatus, section, parseTasks, validateTasks, buildBatches } from './logic.ts'
+import { routeFor, phaseOfAgentType, parseVerdict, advance, slugify, parseStart, modelCatalog, groupOf, cleanMessages, thinkingByTool, stateSnapshot, exportStatus, DEFAULT_PROFILES, DEFAULT_EFFORTS, BUILTIN_PROFILES, cpamModel, claudeEffort, compareModels, zeroProfiles, isExcluded, effortBlocked, groupLabel, PHASES, phaseOrder, parseDecision, parseClarifyStatus, pickAnswer, section, parseTasks, validateTasks, buildBatches } from './logic.ts'
 
 describe('ruteo', () => {
   test('los tipos forge:<fase> se reconocen y el resto no', () => {
@@ -185,6 +185,15 @@ describe('gates y tareas', () => {
     expect(parseClarifyStatus('## Status\n**blocked**\n## Blocking questions\n- ¿A o B?')).toBe('blocked')
     expect(parseClarifyStatus('Status: `continue`')).toBe('continue')
     expect(parseClarifyStatus('sin estado')).toBe(undefined)
+  })
+
+  test('si el mensaje final de una fase viene vacío de formato, se usa el último paso que lo trae', () => {
+    const good = '## Status\ncontinue\n\n## Assumptions\n- el recall híbrido está en src/recall.ts'
+    expect(pickAnswer('clarify', 'Listo, ya está.', ['mirando archivos', good, 'ok'])).toBe(good)
+    expect(pickAnswer('clarify', good, ['otro'])).toBe(good)
+    expect(pickAnswer('clarify', 'nada', ['tampoco'])).toBe('nada')
+    expect(pickAnswer('veredicto', 'fin', ['## Veredicto\npasa'])).toBe('## Veredicto\npasa')
+    expect(pickAnswer('explore', 'ok', ['## Hallazgos\n- el índice no se reconstruye al borrar'])).toBe('## Hallazgos\n- el índice no se reconstruye al borrar')
     expect(parseDecision('## Decision\nDecision: replan')).toBe('replan')
     expect(parseDecision('**Decision:** `continue`')).toBe('continue')
     expect(parseDecision('Decision: replan\n...\nDecision: continue')).toBe('continue')
