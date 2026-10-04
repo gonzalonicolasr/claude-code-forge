@@ -10,6 +10,13 @@ export const OPTIONAL_PHASES: readonly Phase[] = ['clarify', 'analyze']
 export const VERDICTS: readonly Verdict[] = ['pasa', 'corregir', 'replantear']
 export const REPLAN_CAP = 2
 export const CLAUDE_ALIASES = ['haiku', 'sonnet', 'opus', 'fable']
+export const CLAUDE_IDS: Record<string, string> = {
+  haiku: 'claude-haiku-4-5-20251001',
+  sonnet: 'claude-sonnet-5-5',
+  opus: 'claude-opus-5-5',
+  fable: 'claude-fable-5-1',
+}
+export const RESERVED_PROFILES = ['custom', 'new', 'nuevo', 'save', 'delete', 'borrar', 'reset', 'restaurar']
 
 export const PHASE_TOOLS: Record<Phase, string[]> = {
   clarify: ['Read', 'Glob', 'Grep', 'Bash'],
@@ -511,9 +518,17 @@ export function exportStatus(status: RunStatus, asking: boolean): ExportStatus {
 
 export function stateSnapshot(i: StateInput) {
   const zero = i.zeroProfiles || []
-  const profiles: Record<string, Record<Phase, string> & { effort: Record<Phase, Effort>; builtin: boolean; source: 'forge' | 'zero-pi' }> = {}
-  for (const [name, p] of Object.entries(i.profiles))
-    profiles[name] = { ...p, effort: { ...AUTO_EFFORTS, ...(i.profileEfforts[name] || {}) }, builtin: BUILTIN_PROFILES.includes(name) || zero.includes(name), source: zero.includes(name) ? 'zero-pi' : 'forge' }
+  const profiles: Record<string, Record<Phase, string> & { effort: Record<Phase, Effort>; builtin: boolean; modified: boolean; source: 'forge' | 'zero-pi' }> = {}
+  for (const [name, p] of Object.entries(i.profiles)) {
+    const fromZero = zero.includes(name)
+    profiles[name] = {
+      ...p,
+      effort: { ...AUTO_EFFORTS, ...(i.profileEfforts[name] || {}) },
+      builtin: !fromZero && BUILTIN_PROFILES.includes(name),
+      modified: !fromZero && builtinModified(name, p, i.profileEfforts[name]),
+      source: fromZero ? 'zero-pi' : 'forge',
+    }
+  }
   const catalog: Record<string, string[]> = {}
   const groupLabels: Record<string, string> = {}
   const labels: Record<string, string> = {}
@@ -587,8 +602,9 @@ export function zeroProfiles(raw: unknown, exclude: readonly string[] = []): { p
   for (const [name, p] of Object.entries<any>(all)) {
     const models = p?.models || {}
     if (exclude.some((x) => name.toLowerCase().includes(x.toLowerCase())) || core.some((ph) => typeof models[ph] !== 'string')) continue
+    const providers = p?.providers || {}
     const picked: Partial<Record<Phase, string>> = {}
-    for (const ph of PHASES) if (typeof models[ph] === 'string' && models[ph]) picked[ph] = models[ph]
+    for (const ph of PHASES) if (typeof models[ph] === 'string' && models[ph]) picked[ph] = providers[ph] === 'anthropic' ? aliasOf(models[ph]) : models[ph]
     const full = fillPhases(picked)
     if (PHASES.some((ph) => isExcluded(full[ph], exclude))) continue
     const key = `zero:${name}`
@@ -598,4 +614,61 @@ export function zeroProfiles(raw: unknown, exclude: readonly string[] = []): { p
     for (const ph of PHASES) if (isEffort(th[ph])) out.efforts[key][ph] = th[ph]
   }
   return out
+}
+
+export function aliasOf(id: string): string {
+  return Object.entries(CLAUDE_IDS).find(([, v]) => v === id)?.[0] || id
+}
+
+export function builtinModified(name: string, models: Readonly<Record<Phase, string>> | undefined, efforts: Readonly<Partial<Record<Phase, Effort>>> | undefined): boolean {
+  const base = DEFAULT_PROFILES[name]
+  if (!base || !models) return false
+  return PHASES.some((p) => models[p] !== base[p] || (efforts?.[p] || 'auto') !== DEFAULT_EFFORTS[name]![p])
+}
+
+export function zeroTarget(model: string): { provider: string; model: string } {
+  const m = String(model || '').trim()
+  if (CLAUDE_ALIASES.includes(m)) return { provider: 'anthropic', model: CLAUDE_IDS[m]! }
+  if (/^claude-/.test(m)) return { provider: 'anthropic', model: m }
+  return { provider: 'cliproxy', model: m }
+}
+
+export function editZeroProfile(raw: string, name: string, phase: Phase, change: { model?: string; effort?: Effort }): { text: string } | { error: string } {
+  let data: any
+  try {
+    data = JSON.parse(String(raw || ''))
+  } catch {
+    return { error: '~/.pi/zero.json no es JSON válido' }
+  }
+  const p = data?.profiles?.[name]
+  if (!p || typeof p !== 'object') return { error: `~/.pi/zero.json no tiene el perfil ${name}` }
+  if (change.model !== undefined) {
+    const target = zeroTarget(change.model)
+    p.models = { ...(p.models || {}), [phase]: target.model }
+    if (p.providers && typeof p.providers === 'object') p.providers[phase] = target.provider
+    else p.providers = { [phase]: target.provider }
+  }
+  if (change.effort !== undefined) {
+    if (change.effort === 'auto') {
+      if (p.thinking && typeof p.thinking === 'object') delete p.thinking[phase]
+    } else if (p.thinking && typeof p.thinking === 'object') p.thinking[phase] = change.effort
+    else p.thinking = { [phase]: change.effort }
+  }
+  return { text: JSON.stringify(data, null, 2) + (String(raw).endsWith('\n') ? '\n' : '') }
+}
+
+export function profileName(raw: string, taken: readonly string[]): { name: string } | { error: string } {
+  const name = String(raw || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, '-')
+    .replace(/[^a-z0-9._-]/g, '')
+    .replace(/^[-.]+|[-.]+$/g, '')
+    .slice(0, 40)
+  if (!name) return { error: 'el nombre queda vacío: usá letras, números, punto, guion o guion bajo' }
+  if (RESERVED_PROFILES.includes(name) || BUILTIN_PROFILES.includes(name)) return { error: `${name} es un nombre reservado` }
+  if (taken.includes(name)) return { error: `ya existe el perfil ${name}` }
+  return { name }
 }

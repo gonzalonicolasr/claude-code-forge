@@ -39,12 +39,15 @@ import {
   parseTasks,
   validateTasks,
   buildBatches,
+  builtinModified,
+  editZeroProfile,
+  profileName,
 } from './logic.ts'
 import type { Phase, Verdict, Mode, RunStatus, Effort, Decision, Outcome } from './logic.ts'
 import { PHASE_PROMPTS, briefFor, startInstruction, nextInstruction, finalInstruction } from './prompts.ts'
 
 const PANE = 'forge'
-const VERSION = '0.3.0'
+const VERSION = '0.4.0'
 const CPAM = 'http://127.0.0.1:8317'
 const C = {
   violet: '#8b5cf6',
@@ -232,11 +235,57 @@ const STATUS_LABEL: Record<RunStatus, string> = {
 
 const mapValues = <T, U>(o: Record<string, T>, f: (v: T) => U) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, f(v)]))
 
+type Own = { profiles: Record<string, Record<Phase, string>>; efforts: Record<string, Record<Phase, Effort>> }
+let zeroImport: Own = { profiles: {}, efforts: {} }
+let zeroStamp = ''
+let zeroBackedUp = false
+let editing = 0
+let editGen = 0
+
+async function readOwn($: any): Promise<Own> {
+  const sp: any = await $.store.get('profiles').catch(() => undefined)
+  const se: any = await $.store.get('profileEfforts').catch(() => undefined)
+  return {
+    profiles: sp && typeof sp === 'object' ? mapValues<any, Record<Phase, string>>(sp, fillPhases) : {},
+    efforts: se && typeof se === 'object' ? mapValues<any, Record<Phase, Effort>>(se, (e) => ({ ...AUTO_EFFORTS, ...e })) : {},
+  }
+}
+
+function currentOwn(): Own {
+  const keep = Object.keys(profiles).filter((n) => !zeroNames.includes(n))
+  return { profiles: Object.fromEntries(keep.map((n) => [n, profiles[n]!])), efforts: Object.fromEntries(keep.filter((n) => profileEfforts[n]).map((n) => [n, profileEfforts[n]!])) }
+}
+
+function rebuild(own: Own) {
+  profiles = { ...DEFAULT_PROFILES, ...own.profiles, ...zeroImport.profiles }
+  profileEfforts = { ...DEFAULT_EFFORTS, ...own.efforts, ...zeroImport.efforts }
+  zeroNames = Object.keys(zeroImport.profiles)
+}
+
+function importZero(raw: string): boolean {
+  let data: any
+  try {
+    data = raw ? JSON.parse(raw) : {}
+  } catch {
+    return false
+  }
+  zeroImport = zeroProfiles(data, excluded)
+  return true
+}
+
+async function zeroMtime($: any): Promise<string> {
+  const st: any = home ? await $.fs.stat(`${home}/.pi/zero.json`).catch(() => undefined) : undefined
+  return st ? `${st.mtimeMs}:${st.size}` : ''
+}
+
+async function saveOwn($: any) {
+  const keep = Object.keys(profiles).filter((n) => !zeroNames.includes(n) && (!BUILTIN_PROFILES.includes(n) || builtinModified(n, profiles[n], profileEfforts[n])))
+  await $.store.set('profiles', Object.fromEntries(keep.map((n) => [n, profiles[n]]))).catch(() => undefined)
+  await $.store.set('profileEfforts', Object.fromEntries(keep.filter((n) => profileEfforts[n]).map((n) => [n, profileEfforts[n]]))).catch(() => undefined)
+}
+
 async function loadConfig($: any) {
-  const savedProfiles: any = await $.store.get('profiles').catch(() => undefined)
-  if (savedProfiles && typeof savedProfiles === 'object') profiles = { ...DEFAULT_PROFILES, ...mapValues<any, Record<Phase, string>>(savedProfiles, fillPhases) }
-  const savedEfforts: any = await $.store.get('profileEfforts').catch(() => undefined)
-  if (savedEfforts && typeof savedEfforts === 'object') profileEfforts = { ...DEFAULT_EFFORTS, ...mapValues<any, Record<Phase, Effort>>(savedEfforts, (e) => ({ ...AUTO_EFFORTS, ...e })) }
+  const own = await readOwn($)
   try {
     const ex = JSON.parse(String((home ? await $.fs.read(`${home}/.config/forge/exclude.json`).catch(() => '') : '') || '[]'))
     excluded = Array.isArray(ex) ? ex.filter((x) => typeof x === 'string' && x) : []
@@ -249,15 +298,9 @@ async function loadConfig($: any) {
   } catch {
     fallbackModel = DEFAULT_FALLBACK
   }
-  const zeroRaw = home ? await $.fs.read(`${home}/.pi/zero.json`).catch(() => '') : ''
-  let zero: any = {}
-  try {
-    zero = zeroRaw ? JSON.parse(String(zeroRaw)) : {}
-  } catch {}
-  const z = zeroProfiles(zero, excluded)
-  zeroNames = Object.keys(z.profiles)
-  profiles = { ...profiles, ...z.profiles }
-  profileEfforts = { ...profileEfforts, ...z.efforts }
+  zeroStamp = await zeroMtime($)
+  if (!importZero(String((home ? await $.fs.read(`${home}/.pi/zero.json`).catch(() => '') : '') || ''))) zeroImport = { profiles: {}, efforts: {} }
+  rebuild(own)
   const saved: any = await $.store.get('config').catch(() => undefined)
   if (saved && typeof saved === 'object') {
     const base = profiles[saved.profile] || {}
@@ -269,10 +312,6 @@ async function loadConfig($: any) {
       skip: Array.isArray(saved.skip) ? saved.skip.filter((p: Phase) => OPTIONAL_PHASES.includes(p)) : [],
     }
   }
-}
-
-function own<T>(all: Record<string, T>): Record<string, T> {
-  return Object.fromEntries(Object.entries(all).filter(([n]) => !zeroNames.includes(n)))
 }
 
 async function saveConfig($: any) {
@@ -375,12 +414,25 @@ let inboxSeen = ''
 let inboxBusy = false
 let syncBusy = false
 
+async function syncProfiles($: any, gen: number): Promise<boolean> {
+  const own = await readOwn($)
+  const st = await zeroMtime($)
+  if (st !== zeroStamp && importZero(String((await $.fs.read(`${home}/.pi/zero.json`).catch(() => '')) || ''))) zeroStamp = st
+  if (editing || gen !== editGen) return false
+  const before = JSON.stringify([profiles, profileEfforts])
+  rebuild(own)
+  return JSON.stringify([profiles, profileEfforts]) !== before
+}
+
 async function syncConfig($: any) {
-  if (syncBusy) return
+  if (syncBusy || editing) return
   syncBusy = true
+  const gen = editGen
   try {
+    if (await syncProfiles($, gen)) $.ui.invalidate('ui.render')
+    if (editing || gen !== editGen) return
     const saved: any = await $.store.get('config').catch(() => undefined)
-    if (!saved || typeof saved !== 'object') return
+    if (!saved || typeof saved !== 'object' || editing || gen !== editGen) return
     const next = {
       ...config,
       ...saved,
@@ -445,30 +497,87 @@ async function persist($: any) {
   await $.fs.write(`${run.dir}/routing.log`, routing.join('\n') + (routing.length ? '\n' : '')).catch(() => undefined)
 }
 
-function matchProfile() {
-  const match = Object.entries(profiles).find(([n, p]) => PHASES.every((k) => p[k] === config.models[k] && (profileEfforts[n]?.[k] || 'auto') === config.efforts[k]))
-  config.profile = match ? match[0] : 'custom'
+function selectCurrent(name: string) {
+  config.profile = name
+  config.models = { ...profiles[name]! }
+  config.efforts = { ...AUTO_EFFORTS, ...(profileEfforts[name] || {}) }
+}
+
+async function writeZero($: any, key: string, phase: Phase, change: { model?: string; effort?: Effort }): Promise<string> {
+  if (!home) home = (await $.env.get('HOME').catch(() => '')) || ''
+  const path = `${home}/.pi/zero.json`
+  const raw = home ? await $.fs.read(path).catch(() => undefined) : undefined
+  if (typeof raw !== 'string' || !raw) return `no pude leer ${path}`
+  const res = editZeroProfile(raw, key, phase, change)
+  if ('error' in res) return res.error
+  if (!zeroBackedUp) {
+    try {
+      await $.fs.write(`${path}.bak-forge-${stamp().replace(/:/g, '')}`, raw)
+      zeroBackedUp = true
+    } catch (err) {
+      return `no pude hacer el backup de ${path}: ${err}`
+    }
+  }
+  try {
+    await $.fs.write(path, res.text)
+  } catch (err) {
+    return `no pude escribir ${path}: ${err}`
+  }
+  const own = currentOwn()
+  importZero(res.text)
+  zeroStamp = await zeroMtime($)
+  rebuild(own)
+  return ''
+}
+
+async function editPhase($: any, phase: Phase, change: { model?: string; effort?: Effort }): Promise<string> {
+  editing++
+  editGen++
+  try {
+    const name = config.profile
+    let note = ''
+    if (zeroNames.includes(name)) {
+      const err = await writeZero($, name.slice('zero:'.length), phase, change)
+      if (err) return `⚠ ${err}`
+      if (profiles[name]) {
+        selectCurrent(name)
+        note = ` · ${name} guardado en ~/.pi/zero.json`
+      } else note = ` · guardado en ~/.pi/zero.json, pero ${name} ya no se importa`
+    } else if (profiles[name]) {
+      profiles = { ...profiles, [name]: { ...profiles[name]!, ...(change.model !== undefined ? { [phase]: change.model } : {}) } }
+      profileEfforts = { ...profileEfforts, [name]: { ...AUTO_EFFORTS, ...(profileEfforts[name] || {}), ...(change.effort !== undefined ? { [phase]: change.effort } : {}) } }
+      await saveOwn($)
+      selectCurrent(name)
+      note = !BUILTIN_PROFILES.includes(name)
+        ? ` · perfil ${name} actualizado`
+        : builtinModified(name, profiles[name], profileEfforts[name])
+          ? ` · perfil ${name} ★ modificado (/forge profile reset ${name} lo restaura)`
+          : ` · perfil ${name} quedó como de fábrica`
+    }
+    if (config.profile !== name || !profiles[name]) {
+      config.profile = profiles[config.profile] ? config.profile : 'custom'
+      if (change.model !== undefined) config.models = { ...config.models, [phase]: change.model }
+      if (change.effort !== undefined) config.efforts = { ...config.efforts, [phase]: change.effort }
+    }
+    await saveConfig($)
+    $.ui.invalidate('ui.render')
+    return note
+  } finally {
+    editing--
+  }
 }
 
 async function setModel($: any, phase: Phase, model: string) {
-  config.models = { ...config.models, [phase]: model }
-  matchProfile()
-  await saveConfig($)
-  $.ui.invalidate('ui.render')
+  return editPhase($, phase, { model })
 }
 
 async function setEffort($: any, phase: Phase, effort: Effort) {
-  config.efforts = { ...config.efforts, [phase]: effort }
-  matchProfile()
-  await saveConfig($)
-  $.ui.invalidate('ui.render')
+  return editPhase($, phase, { effort })
 }
 
 async function setProfile($: any, name: string) {
   if (!profiles[name]) return false
-  config.profile = name
-  config.models = { ...profiles[name] }
-  config.efforts = { ...AUTO_EFFORTS, ...(profileEfforts[name] || {}) }
+  selectCurrent(name)
   await saveConfig($)
   $.ui.invalidate('ui.render')
   return true
@@ -570,30 +679,84 @@ async function commandText($: any, args: string): Promise<string | undefined> {
   if (sub === 'stop' || sub === 'parar') return stopRun($, 'pedido por el usuario')
   if (sub === 'status' || sub === 'estado') return statusText($)
   if (sub === 'profile' || sub === 'perfil') {
-    if (rest[0] === 'save' && rest[1]) {
-      profiles = { ...profiles, [rest[1]]: { ...config.models } }
-      profileEfforts = { ...profileEfforts, [rest[1]]: { ...config.efforts } }
-      await $.store.set('profiles', own(profiles)).catch(() => undefined)
-      await $.store.set('profileEfforts', own(profileEfforts)).catch(() => undefined)
-      config.profile = rest[1]
-      await saveConfig($)
+    const op = (rest[0] || '').toLowerCase()
+    if (op === 'new' || op === 'nuevo') {
+      if (!rest[1]) return 'uso: /forge profile new <nombre>'
+      const picked = profileName(rest.slice(1).join(' '), Object.keys(profiles))
+      if ('error' in picked) return `no se creó: ${picked.error}`
+      editing++
+      editGen++
+      try {
+        profiles = { ...profiles, [picked.name]: { ...config.models } }
+        profileEfforts = { ...profileEfforts, [picked.name]: { ...config.efforts } }
+        await saveOwn($)
+        config.profile = picked.name
+        await saveConfig($)
+      } finally {
+        editing--
+      }
+      $.ui.invalidate('ui.render')
+      return `perfil ${picked.name} creado con la config actual y activo`
+    }
+    if (op === 'reset' || op === 'restaurar') {
+      const name = rest[1]
+      if (!name) return 'uso: /forge profile reset <perfil de fábrica>'
+      if (!BUILTIN_PROFILES.includes(name)) return `${name} no es de fábrica: sólo se restauran los de fábrica`
+      if (!builtinModified(name, profiles[name], profileEfforts[name])) return `${name} ya está como de fábrica`
+      editing++
+      editGen++
+      try {
+        profiles = { ...profiles, [name]: { ...DEFAULT_PROFILES[name]! } }
+        profileEfforts = { ...profileEfforts, [name]: { ...DEFAULT_EFFORTS[name]! } }
+        await saveOwn($)
+        if (config.profile === name) selectCurrent(name)
+        await saveConfig($)
+      } finally {
+        editing--
+      }
+      $.ui.invalidate('ui.render')
+      return `perfil ${name} restaurado de fábrica`
+    }
+    if (op === 'save' && rest[1]) {
+      if (zeroNames.includes(rest[1]) || rest[1] === 'custom') return `no se puede guardar como ${rest[1]}`
+      editing++
+      editGen++
+      try {
+        profiles = { ...profiles, [rest[1]]: { ...config.models } }
+        profileEfforts = { ...profileEfforts, [rest[1]]: { ...config.efforts } }
+        await saveOwn($)
+        config.profile = rest[1]
+        await saveConfig($)
+      } finally {
+        editing--
+      }
       return `perfil ${rest[1]} guardado`
     }
-    if ((rest[0] === 'delete' || rest[0] === 'borrar') && rest[1]) {
-      if (BUILTIN_PROFILES.includes(rest[1])) return `${rest[1]} es de fábrica, no se borra`
-      if (zeroNames.includes(rest[1])) return `${rest[1]} viene de ~/.pi/zero.json: se edita en zero-pi`
-      if (!profiles[rest[1]]) return `no existe el perfil ${rest[1]}`
-      const { [rest[1]]: _gone, ...left } = profiles
-      const { [rest[1]]: _goneEffort, ...leftEfforts } = profileEfforts
-      profiles = left
-      profileEfforts = leftEfforts
-      await $.store.set('profiles', own(profiles)).catch(() => undefined)
-      await $.store.set('profileEfforts', own(profileEfforts)).catch(() => undefined)
-      if (config.profile === rest[1]) config.profile = 'custom'
-      await saveConfig($)
-      return `perfil ${rest[1]} borrado`
+    if ((op === 'delete' || op === 'borrar') && rest[1]) {
+      const name = rest[1]
+      if (BUILTIN_PROFILES.includes(name)) return `${name} es de fábrica, no se borra${builtinModified(name, profiles[name], profileEfforts[name]) ? ` · /forge profile reset ${name} lo restaura` : ''}`
+      if (zeroNames.includes(name)) return `${name} viene de ~/.pi/zero.json: se borra en zero-pi`
+      if (!profiles[name]) return `no existe el perfil ${name}`
+      editing++
+      editGen++
+      try {
+        const { [name]: _gone, ...left } = profiles
+        const { [name]: _goneEffort, ...leftEfforts } = profileEfforts
+        profiles = left
+        profileEfforts = leftEfforts
+        await saveOwn($)
+        if (config.profile === name) config.profile = 'custom'
+        await saveConfig($)
+      } finally {
+        editing--
+      }
+      $.ui.invalidate('ui.render')
+      return `perfil ${name} borrado`
     }
-    if (!rest[0]) return `perfiles: ${Object.keys(profiles).join(', ')} · activo: ${config.profile}`
+    if (!rest[0])
+      return `perfiles: ${Object.keys(profiles)
+        .map((n) => (builtinModified(n, profiles[n], profileEfforts[n]) ? `${n} ★` : n))
+        .join(', ')} · activo: ${config.profile}`
     return (await setProfile($, rest[0])) ? `perfil ${rest[0]} activo` : `no existe el perfil ${rest[0]}`
   }
   if (sub === 'phase' || sub === 'fase') {
@@ -608,14 +771,14 @@ async function commandText($: any, args: string): Promise<string | undefined> {
   if (sub === 'model' || sub === 'modelo') {
     const phase = rest[0] as Phase
     if (!PHASES.includes(phase) || !rest[1]) return `uso: /forge model <${PHASES.join('|')}> <modelo>`
-    await setModel($, phase, rest[1])
-    return `${phase} → ${rest[1]} (${routeFor(rest[1]).kind === 'cpam' ? 'CPAM' : 'Claude Code'})`
+    const note = await setModel($, phase, rest[1])
+    return note.startsWith('⚠') ? note : `${phase} → ${rest[1]} (${routeFor(rest[1]).kind === 'cpam' ? 'CPAM' : 'Claude Code'})${note}`
   }
   if (sub === 'effort' || sub === 'esfuerzo') {
     const phase = rest[0] as Phase
     if (!PHASES.includes(phase) || !isEffort(rest[1])) return `uso: /forge effort <${PHASES.join('|')}> <${EFFORTS.join('|')}>`
-    await setEffort($, phase, rest[1])
-    return `${phase} · effort ${rest[1]}`
+    const note = await setEffort($, phase, rest[1])
+    return note.startsWith('⚠') ? note : `${phase} · effort ${rest[1]}${note}`
   }
   if (sub === 'mode' || sub === 'modo') {
     const m = rest[0] === 'ask' ? 'preguntar' : rest[0]
@@ -961,7 +1124,7 @@ function drawPane($: any, e: any) {
     )
   }
   out.push(card('phases', 'FASES', C.cyan, phaseRows))
-  const profileOptions = [...Object.keys(profiles).map((k) => ({ value: k, label: `perfil ${k}` })), ...(config.profile === 'custom' ? [{ value: 'custom', label: 'perfil custom' }] : [])]
+  const profileOptions = [...Object.keys(profiles).map((k) => ({ value: k, label: `perfil ${k}${builtinModified(k, profiles[k], profileEfforts[k]) ? ' ★' : ''}` })), ...(config.profile === 'custom' ? [{ value: 'custom', label: 'perfil custom' }] : [])]
   out.push(
     card('config', 'CONFIG', C.amber, [
       Select({ key: 'profile', options: profileOptions, value: config.profile, onSelect: (v: string) => void setProfile($, v) }),
@@ -1048,7 +1211,7 @@ export function register(on: any) {
         .register({
           name: 'forge',
           description: 'SDD clarify → explore → plan → analyze → build → veredicto, cada fase en su modelo del CPAM',
-          argumentHint: '<pedido> | stop | status | continue | ui | profile [n|save n|delete n] | model <fase> <id> | effort <fase> <nivel> | phase <clarify|analyze> <on|off> | mode <m> | cap <n>',
+          argumentHint: '<pedido> | stop | status | continue | ui | profile [n|new n|save n|delete n|reset n] | model <fase> <id> | effort <fase> <nivel> | phase <clarify|analyze> <on|off> | mode <m> | cap <n>',
           immediate: true,
         })
         .catch((err: any) => $.ui.log(`forge: /forge no registrado: ${err}`, { to: 'debug' }))

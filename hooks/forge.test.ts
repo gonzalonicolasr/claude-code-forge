@@ -1,5 +1,5 @@
 import { expect, test, describe, mock } from 'claude-code/testing'
-import { routeFor, phaseOfAgentType, parseVerdict, advance, slugify, parseStart, modelCatalog, groupOf, cleanMessages, thinkingByTool, stateSnapshot, exportStatus, DEFAULT_PROFILES, DEFAULT_EFFORTS, BUILTIN_PROFILES, cpamModel, claudeEffort, compareModels, zeroProfiles, isExcluded, effortBlocked, groupLabel, PHASES, phaseOrder, parseDecision, parseClarifyStatus, pickAnswer, forgeMayRun, modelUnavailable, section, parseTasks, validateTasks, buildBatches } from './logic.ts'
+import { zeroTarget, aliasOf, editZeroProfile, profileName, builtinModified, routeFor, phaseOfAgentType, parseVerdict, advance, slugify, parseStart, modelCatalog, groupOf, cleanMessages, thinkingByTool, stateSnapshot, exportStatus, DEFAULT_PROFILES, DEFAULT_EFFORTS, BUILTIN_PROFILES, cpamModel, claudeEffort, compareModels, zeroProfiles, isExcluded, effortBlocked, groupLabel, PHASES, phaseOrder, parseDecision, parseClarifyStatus, pickAnswer, forgeMayRun, modelUnavailable, section, parseTasks, validateTasks, buildBatches } from './logic.ts'
 
 describe('ruteo', () => {
   test('los tipos forge:<fase> se reconocen y el resto no', () => {
@@ -442,13 +442,15 @@ describe('estado exportado', () => {
     for (const name of BUILTIN_PROFILES) expect(state.profiles[name].builtin).toBe(true)
     const del: any = await $.command.run({ command: 'forge', args: 'profile delete turbo' })
     expect(del.text).toBe('turbo es de fábrica, no se borra')
-    await $.command.run({ command: 'forge', args: 'model build prolite/gpt-6-sol' })
-    expect(JSON.parse(files['/h/.local/state/forge/state.json']).profile).toBe('custom')
+    const mb: any = await $.command.run({ command: 'forge', args: 'model build prolite/gpt-6-sol' })
+    expect(mb.text).toBe('build → prolite/gpt-6-sol (CPAM) · perfil equilibrado ★ modificado (/forge profile reset equilibrado lo restaura)')
+    const edited = JSON.parse(files['/h/.local/state/forge/state.json'])
+    expect([edited.profile, edited.profiles.equilibrado.build, edited.profiles.equilibrado.modified, edited.profiles.turbo.modified]).toEqual(['equilibrado', 'prolite/gpt-6-sol', true, false])
     const eff: any = await $.command.run({ command: 'forge', args: 'effort plan xhigh' })
-    expect(eff.text).toBe('plan · effort xhigh')
+    expect(eff.text.startsWith('plan · effort xhigh · perfil equilibrado ★ modificado')).toBe(true)
     expect(JSON.parse(files['/h/.local/state/forge/state.json']).efforts.plan).toBe('xhigh')
     const cl: any = await $.command.run({ command: 'forge', args: 'model clarify ag3/gemini-3.5-flash-lite' })
-    expect(cl.text).toBe('clarify → ag3/gemini-3.5-flash-lite (CPAM)')
+    expect(cl.text.startsWith('clarify → ag3/gemini-3.5-flash-lite (CPAM) · perfil equilibrado')).toBe(true)
     await $.command.run({ command: 'forge', args: 'effort analyze low' })
     const mid = JSON.parse(files['/h/.local/state/forge/state.json'])
     expect([mid.models.clarify, mid.efforts.analyze]).toEqual(['ag3/gemini-3.5-flash-lite', 'low'])
@@ -465,10 +467,148 @@ describe('estado exportado', () => {
     await $.command.run({ command: 'forge', args: 'mode ask' })
     await $.command.run({ command: 'forge', args: 'cap 5' })
     const after = JSON.parse(files['/h/.local/state/forge/state.json'])
-    expect(after.profiles.mio).toEqual({ ...DEFAULT_PROFILES.equilibrado, build: 'prolite/gpt-6-sol', effort: { ...DEFAULT_EFFORTS.equilibrado, plan: 'xhigh' }, builtin: false, source: 'forge' })
+    expect(after.profiles.mio).toEqual({ ...DEFAULT_PROFILES.equilibrado, build: 'prolite/gpt-6-sol', effort: { ...DEFAULT_EFFORTS.equilibrado, plan: 'xhigh' }, builtin: false, modified: false, source: 'forge' })
     expect([after.mode, after.cap, after.profile]).toEqual(['ask', 5, 'mio'])
+    const del2: any = await $.command.run({ command: 'forge', args: 'profile delete equilibrado' })
+    expect(del2.text).toBe('equilibrado es de fábrica, no se borra · /forge profile reset equilibrado lo restaura')
+    const reset: any = await $.command.run({ command: 'forge', args: 'profile reset equilibrado' })
+    expect(reset.text).toBe('perfil equilibrado restaurado de fábrica')
+    const restored = JSON.parse(files['/h/.local/state/forge/state.json'])
+    expect([restored.profiles.equilibrado.build, restored.profiles.equilibrado.effort.plan, restored.profiles.equilibrado.modified, restored.profile]).toEqual([DEFAULT_PROFILES.equilibrado.build, DEFAULT_EFFORTS.equilibrado.plan, false, 'mio'])
+    expect(restored.profiles.mio.build).toBe('prolite/gpt-6-sol')
+    expect(((await $.command.run({ command: 'forge', args: 'profile reset equilibrado' })) as any).text).toBe('equilibrado ya está como de fábrica')
+    expect(((await $.command.run({ command: 'forge', args: 'profile reset mio' })) as any).text).toBe('mio no es de fábrica: sólo se restauran los de fábrica')
     const gone: any = await $.command.run({ command: 'forge', args: 'profile delete mio' })
     expect(gone.text).toBe('perfil mio borrado')
-    expect(JSON.parse(files['/h/.local/state/forge/state.json']).profiles.mio).toBe(undefined)
+    const last = JSON.parse(files['/h/.local/state/forge/state.json'])
+    expect([last.profiles.mio, last.profile]).toEqual([undefined, 'custom'])
+  })
+})
+
+const ZERO = {
+  models: { explore: 'personal/claude-sonnet-5-5' },
+  profiles: {
+    'solo-claude': {
+      models: { clarify: 'personal/claude-sonnet-5-5', explore: 'personal/claude-sonnet-5-5', plan: 'personal/claude-opus-5-5', analyze: 'personal/claude-opus-5-5', build: 'personal/claude-opus-5-5', veredicto: 'personal/claude-opus-5-5' },
+      providers: { clarify: 'cliproxy', explore: 'cliproxy', plan: 'cliproxy', analyze: 'cliproxy', build: 'cliproxy', veredicto: 'cliproxy' },
+      thinking: { clarify: 'medium', explore: 'high', plan: 'xhigh', analyze: 'high', build: 'high', veredicto: 'xhigh' },
+    },
+    'solo-gemini': {
+      models: { explore: 'ag/gemini-3.8-flash-high', plan: 'ag/gemini-pro-agent', build: 'ag/gemini-3.8-flash-high', veredicto: 'ag/gemini-pro-agent' },
+      providers: { explore: 'cliproxy', plan: 'cliproxy', build: 'cliproxy', veredicto: 'cliproxy' },
+    },
+  },
+  activeProfile: 'solo-claude',
+}
+
+describe('perfiles editables', () => {
+  test('los alias del plan de Claude van a zero-pi como anthropic con el id concreto; lo del CPAM queda en cliproxy', () => {
+    expect(zeroTarget('fable')).toEqual({ provider: 'anthropic', model: 'claude-fable-5-1' })
+    expect(zeroTarget('haiku')).toEqual({ provider: 'anthropic', model: 'claude-haiku-4-5-20251001' })
+    expect(zeroTarget('sonnet')).toEqual({ provider: 'anthropic', model: 'claude-sonnet-5-5' })
+    expect(zeroTarget('opus')).toEqual({ provider: 'anthropic', model: 'claude-opus-5-5' })
+    expect(zeroTarget('claude-opus-4-8')).toEqual({ provider: 'anthropic', model: 'claude-opus-4-8' })
+    expect(zeroTarget('personal/claude-opus-5-5')).toEqual({ provider: 'cliproxy', model: 'personal/claude-opus-5-5' })
+    expect(zeroTarget('prolite/gpt-6-sol')).toEqual({ provider: 'cliproxy', model: 'prolite/gpt-6-sol' })
+    expect(zeroTarget('ag/gemini-pro-agent')).toEqual({ provider: 'cliproxy', model: 'ag/gemini-pro-agent' })
+    expect(zeroTarget('toString')).toEqual({ provider: 'cliproxy', model: 'toString' })
+    expect([aliasOf('claude-fable-5-1'), aliasOf('claude-opus-4-8')]).toEqual(['fable', 'claude-opus-4-8'])
+    const z = zeroProfiles({ profiles: { x: { models: { explore: 'claude-haiku-4-5-20251001', plan: 'claude-opus-5-5', build: 'claude-opus-5-5', veredicto: 'personal/claude-opus-5-5' }, providers: { explore: 'anthropic', plan: 'anthropic', build: 'cliproxy', veredicto: 'cliproxy' } } } })
+    expect(z.profiles['zero:x']).toEqual({ clarify: 'haiku', explore: 'haiku', plan: 'opus', analyze: 'opus', build: 'claude-opus-5-5', veredicto: 'personal/claude-opus-5-5' })
+  })
+
+  test('editar un perfil de zero-pi toca sólo esa fase y deja el resto del archivo igual, con el mismo orden', () => {
+    const raw = JSON.stringify(ZERO, null, 2) + '\n'
+    const r: any = editZeroProfile(raw, 'solo-claude', 'analyze', { model: 'fable' })
+    const want = JSON.parse(raw)
+    want.profiles['solo-claude'].models.analyze = 'claude-fable-5-1'
+    want.profiles['solo-claude'].providers.analyze = 'anthropic'
+    expect(r.text).toBe(JSON.stringify(want, null, 2) + '\n')
+    const auto: any = editZeroProfile(r.text, 'solo-claude', 'analyze', { effort: 'auto' })
+    expect(Object.keys(JSON.parse(auto.text).profiles['solo-claude'].thinking)).toEqual(['clarify', 'explore', 'plan', 'build', 'veredicto'])
+    const gem: any = editZeroProfile(raw, 'solo-gemini', 'clarify', { model: 'prolite/gpt-6-luna', effort: 'low' })
+    const g = JSON.parse(gem.text).profiles['solo-gemini']
+    expect([g.models.clarify, g.providers.clarify, g.thinking]).toEqual(['prolite/gpt-6-luna', 'cliproxy', { clarify: 'low' }])
+    expect(JSON.stringify(JSON.parse(gem.text).profiles['solo-claude'])).toBe(JSON.stringify(ZERO.profiles['solo-claude']))
+    expect(editZeroProfile(raw, 'no-existe', 'plan', { model: 'opus' })).toEqual({ error: '~/.pi/zero.json no tiene el perfil no-existe' })
+    expect('error' in editZeroProfile('{roto', 'solo-claude', 'plan', { model: 'opus' })).toBe(true)
+  })
+
+  test('los nombres de perfil nuevos se limpian y no pisan otros ni los reservados', () => {
+    expect(profileName('Mi Perfil Rápido!', [])).toEqual({ name: 'mi-perfil-rapido' })
+    expect(profileName('  .x_1.2-  ', [])).toEqual({ name: 'x_1.2' })
+    expect(profileName('mio', ['mio'])).toEqual({ error: 'ya existe el perfil mio' })
+    expect(profileName('custom', [])).toEqual({ error: 'custom es un nombre reservado' })
+    expect(profileName('turbo', [])).toEqual({ error: 'turbo es un nombre reservado' })
+    expect('error' in profileName('¡¡!!', [])).toBe(true)
+    expect(builtinModified('turbo', DEFAULT_PROFILES.turbo, DEFAULT_EFFORTS.turbo)).toBe(false)
+    expect(builtinModified('turbo', { ...DEFAULT_PROFILES.turbo, plan: 'opus' }, DEFAULT_EFFORTS.turbo)).toBe(true)
+    expect(builtinModified('turbo', DEFAULT_PROFILES.turbo, { ...DEFAULT_EFFORTS.turbo, plan: 'auto' })).toBe(true)
+    expect(builtinModified('mio', DEFAULT_PROFILES.turbo, DEFAULT_EFFORTS.turbo)).toBe(false)
+  })
+
+  test('cambiar una fase con un perfil de zero-pi activo lo escribe en zero.json, hace un solo backup y el perfil sigue elegido', async ($, on) => {
+    mock.env(on, { HOME: '/h' })
+    mock.store(on)
+    const raw = JSON.stringify(ZERO, null, 2) + '\n'
+    const files: Record<string, string> = {}
+    const writes: string[] = []
+    on('fs.read', async (_$: any, e: any) => ({ value: e.path in files ? files[e.path] : e.path === '/h/.pi/zero.json' ? raw : '' }))
+    on('fs.stat', async (_$: any, e: any) => (e.path === '/h/.pi/zero.json' ? { value: { kind: 'file', size: (files[e.path] || raw).length, mtimeMs: writes.length } } : { deny: 'no existe' }))
+    on('fs.write', async (_$: any, e: any) => {
+      files[e.path] = e.text
+      writes.push(e.path)
+      return { value: undefined }
+    })
+    on('process.run', async () => ({ exitCode: 0, stdout: '', stderr: '' }))
+    on('command.list', async () => [])
+    on('session.start', async (_$: any, e: any) => ({ cwd: e.cwd }))
+    await $.session.start({ cwd: '/tmp', surface: null, isInteractive: false })
+    expect(((await $.command.run({ command: 'forge', args: 'profile zero:solo-claude' })) as any).text).toBe('perfil zero:solo-claude activo')
+    const r: any = await $.command.run({ command: 'forge', args: 'model analyze fable' })
+    expect(r.text).toBe('analyze → fable (Claude Code) · zero:solo-claude guardado en ~/.pi/zero.json')
+    const written = JSON.parse(files['/h/.pi/zero.json'])
+    expect([written.profiles['solo-claude'].models.analyze, written.profiles['solo-claude'].providers.analyze]).toEqual(['claude-fable-5-1', 'anthropic'])
+    expect(written.profiles['solo-gemini']).toEqual(ZERO.profiles['solo-gemini'])
+    expect([written.models, written.activeProfile]).toEqual([ZERO.models, 'solo-claude'])
+    const backups = Object.keys(files).filter((f) => f.startsWith('/h/.pi/zero.json.bak-forge-'))
+    expect(backups.length).toBe(1)
+    expect(files[backups[0]!]).toBe(raw)
+    const st = JSON.parse(files['/h/.local/state/forge/state.json'])
+    expect([st.profile, st.models.analyze, st.profiles['zero:solo-claude'].analyze, st.profiles['zero:solo-claude'].source]).toEqual(['zero:solo-claude', 'fable', 'fable', 'zero-pi'])
+    const e: any = await $.command.run({ command: 'forge', args: 'effort plan medium' })
+    expect(e.text).toBe('plan · effort medium · zero:solo-claude guardado en ~/.pi/zero.json')
+    await $.command.run({ command: 'forge', args: 'effort analyze auto' })
+    const again = JSON.parse(files['/h/.pi/zero.json']).profiles['solo-claude']
+    expect([again.thinking.plan, 'analyze' in again.thinking]).toEqual(['medium', false])
+    expect(Object.keys(files).filter((f) => f.startsWith('/h/.pi/zero.json.bak-forge-')).length).toBe(1)
+    const st2 = JSON.parse(files['/h/.local/state/forge/state.json'])
+    expect([st2.profile, st2.efforts.plan, st2.efforts.analyze]).toEqual(['zero:solo-claude', 'medium', 'auto'])
+  })
+
+  test('profile new copia la config actual en un perfil propio y lo elige; delete lo saca', async ($, on) => {
+    mock.env(on, { HOME: '/h' })
+    mock.store(on)
+    const files: Record<string, string> = {}
+    on('fs.write', async (_$: any, e: any) => {
+      files[e.path] = e.text
+    })
+    on('process.run', async () => ({ exitCode: 0, stdout: '', stderr: '' }))
+    on('command.list', async () => [])
+    await $.command.run({ command: 'forge', args: 'profile turbo' })
+    const made: any = await $.command.run({ command: 'forge', args: 'profile new Prueba X' })
+    expect(made.text).toBe('perfil prueba-x creado con la config actual y activo')
+    const st = JSON.parse(files['/h/.local/state/forge/state.json'])
+    expect([st.profile, st.profiles['prueba-x'].builtin, st.profiles['prueba-x'].source, st.profiles['prueba-x'].plan, st.profiles['prueba-x'].effort.plan]).toEqual(['prueba-x', false, 'forge', DEFAULT_PROFILES.turbo.plan, DEFAULT_EFFORTS.turbo.plan])
+    expect(((await $.command.run({ command: 'forge', args: 'profile new prueba-x' })) as any).text).toBe('no se creó: ya existe el perfil prueba-x')
+    expect(((await $.command.run({ command: 'forge', args: 'profile new custom' })) as any).text).toBe('no se creó: custom es un nombre reservado')
+    expect(((await $.command.run({ command: 'forge', args: 'profile new' })) as any).text).toBe('uso: /forge profile new <nombre>')
+    const m: any = await $.command.run({ command: 'forge', args: 'model plan opus' })
+    expect(m.text).toBe('plan → opus (Claude Code) · perfil prueba-x actualizado')
+    const st2 = JSON.parse(files['/h/.local/state/forge/state.json'])
+    expect([st2.profile, st2.profiles['prueba-x'].plan, st2.profiles.turbo.plan]).toEqual(['prueba-x', 'opus', DEFAULT_PROFILES.turbo.plan])
+    expect(((await $.command.run({ command: 'forge', args: 'profile delete prueba-x' })) as any).text).toBe('perfil prueba-x borrado')
+    const st3 = JSON.parse(files['/h/.local/state/forge/state.json'])
+    expect([st3.profiles['prueba-x'], st3.profile]).toEqual([undefined, 'custom'])
   })
 })
