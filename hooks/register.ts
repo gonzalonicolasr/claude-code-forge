@@ -327,6 +327,7 @@ async function exportState($: any) {
   if (headless) return
   if (!home) home = (await $.env.get('HOME').catch(() => '')) || ''
   if (!home) return
+  if (!editing) await syncConfig($)
   const dir = `${home}/.local/state/forge`
   if (!stateDirReady) {
     const made = await $.process.run(['mkdir', '-p', dir]).catch(() => ({ exitCode: 1 }))
