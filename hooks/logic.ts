@@ -466,6 +466,48 @@ export function parseStart(args: string): StartArgs {
   return out
 }
 
+export const NODD_MARKER = 'Promoted from the NODD run'
+
+export function noddHandoffProblem(files: readonly string[], requirements: string): string {
+  const has = new Set(files)
+  if (!has.has('requirements.md')) return 'no tiene requirements.md'
+  if (!new RegExp(`^\\s*${NODD_MARKER}\\b`, 'm').test(String(requirements || ''))) return `su requirements.md no trae la línea «${NODD_MARKER}»`
+  const identity = ['run.json', 'execution.json'].filter((f) => has.has(f))
+  if (identity.length) return `ya es un run (${identity.join(', ')})`
+  const plan = ['design.md', 'tasks.md'].filter((f) => has.has(f))
+  if (plan.length) return `ya tiene plan (${plan.join(', ')})`
+  if (has.has('request.md')) return 'ya tiene request.md'
+  return ''
+}
+
+export function isNoddHandoff(files: readonly string[], requirements: string): boolean {
+  return !noddHandoffProblem(files, requirements)
+}
+
+export function adoptedRunResumable(files: readonly string[], requirements: string, saved: any): boolean {
+  const has = new Set(files)
+  return (
+    has.has('requirements.md') &&
+    new RegExp(`^\\s*${NODD_MARKER}\\b`, 'm').test(String(requirements || '')) &&
+    saved?.origin === 'nodd' &&
+    saved.status !== 'running' &&
+    !has.has('execution.json') &&
+    !has.has('spec.md')
+  )
+}
+
+export type ContinueArgs = { slug: string; mode?: Mode; cap?: number; profile?: string }
+
+export function parseContinue(args: string): ContinueArgs | { error: string } | undefined {
+  const [head, ...rest] = String(args || '').trim().split(/\s+/)
+  const sub = (head || '').toLowerCase()
+  if (sub !== 'continue' && sub !== 'seguir') return undefined
+  const { request, ...flags } = parseStart(rest.join(' '))
+  if (/\s/.test(request)) return { error: 'uso: /forge continue [--auto|--interactive] [--cap N] [--profile p] [<slug>]' }
+  if (request && (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(request) || request.includes('..'))) return { error: `slug inválido: ${request}` }
+  return { slug: request, ...flags }
+}
+
 export type ModelGroup = { group: string; label?: string; options: { value: string; label: string }[] }
 
 export function groupOf(model: string): string {
@@ -614,6 +656,7 @@ export type RunView = {
   verdicts: Verdict[]
   decisions?: Decision[]
   size?: Size
+  origin?: 'nodd'
   batch?: { index: number; total: number; tasks: string[]; parallel?: boolean }
 }
 export type StateInput = {
@@ -694,6 +737,7 @@ export function stateSnapshot(i: StateInput) {
         verdicts: [...i.run.verdicts],
         decisions: [...(i.run.decisions || [])],
         size: i.run.size ?? null,
+        origin: i.run.origin ?? null,
       }
     : null
   return {

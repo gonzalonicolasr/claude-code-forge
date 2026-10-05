@@ -8,6 +8,9 @@ import {
   advance,
   slugify,
   parseStart,
+  parseContinue,
+  noddHandoffProblem,
+  adoptedRunResumable,
   modelCatalog,
   groupOf,
   tokens,
@@ -47,7 +50,7 @@ import {
   editZeroProfile,
   profileName,
 } from './logic.ts'
-import type { Phase, Verdict, Mode, RunStatus, Effort, Decision, Outcome, WaveResult, Size } from './logic.ts'
+import type { Phase, Verdict, Mode, RunStatus, Effort, Decision, Outcome, WaveResult, Size, StartArgs } from './logic.ts'
 import { PHASE_PROMPTS, briefFor, startInstruction, nextInstruction, finalInstruction, waveChildInstruction, extraCallDenial, NODD_HINT } from './prompts.ts'
 
 const PANE = 'forge'
@@ -184,6 +187,7 @@ type Run = {
   flights: Record<string, Flight>
   asyncSeen: boolean
   owner?: string
+  origin?: 'nodd'
 }
 type Config = { mode: 'preguntar' | Mode; cap: number; profile: string; models: Record<Phase, string>; efforts: Record<Phase, Effort>; skip: Phase[] }
 
@@ -371,6 +375,7 @@ async function exportState($: any) {
       verdicts: run.verdicts,
       decisions: run.decisions,
       size: run.size,
+      origin: run.origin,
       batch: run.unit && !run.unit.whole ? { index: run.unit.index, total: run.unit.total, tasks: [...run.unit.tasks], parallel: run.unit.parallel } : undefined,
     },
   })
@@ -612,9 +617,12 @@ async function openPane($: any) {
   return r
 }
 
-async function startRun($: any, args: string): Promise<{ error?: string }> {
+type Handoff = { slug: string; dir: string; cwd: string; request: string; resumed?: boolean }
+
+async function startRun($: any, args: string | StartArgs, handoff?: Handoff): Promise<{ error?: string }> {
   if (run && run.status === 'running') return { error: `ya hay un run corriendo (${run.slug}). /forge stop para cortarlo.` }
-  const parsed = parseStart(args)
+  const flags = typeof args === 'string' ? parseStart(args) : args
+  const parsed = handoff ? { ...flags, request: handoff.request } : flags
   if (!parsed.request) return { error: 'falta el pedido: /forge [--auto|--interactive] [--cap N] [--profile barato|calidad] <pedido>' }
   if (parsed.profile && !(await setProfile($, parsed.profile))) return { error: `no existe el perfil "${parsed.profile}" (hay: ${Object.keys(profiles).join(', ')})` }
   let mode: Mode = parsed.mode || (config.mode === 'preguntar' ? 'automatic' : config.mode)
@@ -622,20 +630,28 @@ async function startRun($: any, args: string): Promise<{ error?: string }> {
     const pick = await $.ui.ask('¿En qué modo corre forge?', { options: ['interactive', 'automatic'], header: 'forge' }).catch(() => 'automatic')
     mode = pick === 'interactive' ? 'interactive' : 'automatic'
   }
-  const cwd = await $.session.cwd()
-  const taken = ((await $.fs.list(`${cwd}/.sdd`).catch(() => [])) as any[]).map((f: any) => f.name)
-  const slug = slugify(parsed.request, taken)
-  const dir = `${cwd}/.sdd/${slug}`
-  const made = await $.process.run(['mkdir', '-p', dir]).catch((err: any) => ({ exitCode: 1, stderr: String(err) }))
-  if (made.exitCode !== 0) return { error: `no pude crear ${dir}: ${made.stderr}` }
-  await $.fs.write(`${dir}/request.md`, parsed.request + '\n')
+  let cwd: string, slug: string, dir: string
+  if (handoff) {
+    cwd = handoff.cwd
+    slug = handoff.slug
+    dir = handoff.dir
+    await $.fs.write(`${dir}/request.md`, handoff.request)
+  } else {
+    cwd = await $.session.cwd()
+    const taken = ((await $.fs.list(`${cwd}/.sdd`).catch(() => [])) as any[]).map((f: any) => f.name)
+    slug = slugify(parsed.request, taken)
+    dir = `${cwd}/.sdd/${slug}`
+    const made = await $.process.run(['mkdir', '-p', dir]).catch((err: any) => ({ exitCode: 1, stderr: String(err) }))
+    if (made.exitCode !== 0) return { error: `no pude crear ${dir}: ${made.stderr}` }
+    await $.fs.write(`${dir}/request.md`, parsed.request + '\n')
+  }
   const stats = {} as Record<Phase, Stat>
   for (const p of PHASES) stats[p] = blankStat(config.models[p], config.efforts[p])
   let sddConfig: any = {}
   try {
     sddConfig = JSON.parse(String((await $.fs.read(`${cwd}/.sdd/config.json`).catch(() => '')) || '{}'))
   } catch {}
-  const order = phaseOrder(config.skip)
+  const order = phaseOrder(handoff ? [...config.skip, 'clarify'] : config.skip)
   run = {
     slug,
     dir,
@@ -658,13 +674,67 @@ async function startRun($: any, args: string): Promise<{ error?: string }> {
     stats,
     retried: false,
     note: '',
-    routing: [],
+    routing: handoff?.resumed ? String((await $.fs.read(`${dir}/routing.log`).catch(() => '')) || '').split('\n').filter(Boolean) : [],
     awaitTurn: true,
     asyncSeen: false,
+    ...(handoff ? { origin: 'nodd' as const } : {}),
   }
-  run.routing.push(`${stamp()} run ${slug} · modo ${mode} · cap ${run.cap} · perfil ${config.profile} · tdd ${run.tdd} · fases ${order.join(' → ')} · ${order.map((p) => `${p}=${config.models[p]}`).join(' ')}`)
+  run.routing.push(`${stamp()} run ${slug}${handoff ? ` · ${handoff.resumed ? 'retomado desde explore: era un run adoptado de NODD cortado antes de spec.md' : 'adoptado de NODD'} (requirements.md de /nodd-promote, sin clarify)` : ''} · modo ${mode} · cap ${run.cap} · perfil ${config.profile} · tdd ${run.tdd} · fases ${order.join(' → ')} · ${order.map((p) => `${p}=${config.models[p]}`).join(' ')}`)
   await persist($)
   return {}
+}
+
+async function readHandoff($: any, cwd: string, slug: string): Promise<Handoff | { why: string }> {
+  const dir = `${cwd}/.sdd/${slug}`
+  const listing = await $.fs.list(dir).catch(() => undefined)
+  if (!Array.isArray(listing)) return { why: `no existe ${dir}` }
+  const names = listing.map((f: any) => String(f?.name || ''))
+  const request = names.includes('requirements.md') ? String((await $.fs.read(`${dir}/requirements.md`).catch(() => '')) || '') : ''
+  const why = noddHandoffProblem(names, request)
+  if (!why) return { slug, dir, cwd, request }
+  let saved: any
+  try {
+    saved = names.includes('run.json') ? JSON.parse(String((await $.fs.read(`${dir}/run.json`).catch(() => '')) || '')) : undefined
+  } catch {}
+  return adoptedRunResumable(names, request, saved) ? { slug, dir, cwd, request, resumed: true } : { why }
+}
+
+async function continueRun($: any, args: string): Promise<{ text: string; started: boolean }> {
+  const parsed = parseContinue(args)
+  if (!parsed || 'error' in parsed) return { text: parsed?.error || 'uso: /forge continue [<slug>]', started: false }
+  if (run && run.expected && (run.status === 'parado' || run.status === 'cortado') && (!parsed.slug || parsed.slug === run.slug)) {
+    run.status = 'running'
+    run.note = ''
+    run.endedAt = undefined
+    run.flights = {}
+    if (run.unit) Object.assign(run.unit, { claimed: [], results: {} })
+    run.stats[run.expected] = blankStat(config.models[run.expected], config.efforts[run.expected])
+    await persist($)
+    return { text: `sigo ${run.slug} desde ${run.expected}`, started: true }
+  }
+  if (run && run.status === 'running') return { text: `ya hay un run corriendo (${run.slug}). /forge stop para cortarlo.`, started: false }
+  const cwd = await $.session.cwd().catch(() => '')
+  let handoff: Handoff | undefined
+  if (parsed.slug) {
+    const found = cwd ? await readHandoff($, cwd, parsed.slug) : { why: 'no sé en qué directorio está la sesión' }
+    if ('why' in found) return { text: `no adopto .sdd/${parsed.slug}: no es un handoff de NODD (${found.why}). /forge continue <slug> sólo adopta lo que dejó /nodd-promote: un requirements.md con la línea «Promoted from the NODD run», sin run.json, execution.json, design.md, tasks.md ni request.md.`, started: false }
+    handoff = found
+  } else {
+    const dirs = cwd ? ((await $.fs.list(`${cwd}/.sdd`).catch(() => [])) as any[]).filter((d: any) => d?.kind === 'dir').map((d: any) => String(d.name)) : []
+    const found: Handoff[] = []
+    for (const name of dirs.sort()) {
+      const h = await readHandoff($, cwd, name)
+      if (!('why' in h)) found.push(h)
+    }
+    if (!found.length) return { text: 'no hay un run parado para seguir', started: false }
+    if (found.length > 1) return { text: `hay ${found.length} handoffs de NODD en .sdd/: ${found.map((h) => h.slug).join(', ')}. Elegí uno con /forge continue <slug>.`, started: false }
+    handoff = found[0]
+  }
+  const res = await startRun($, { request: '', mode: parsed.mode, cap: parsed.cap, profile: parsed.profile }, handoff)
+  if (res.error || !run) return { text: res.error || 'forge: no pude adoptar el handoff', started: false }
+  if (handoff!.resumed)
+    return { text: `retomo el run adoptado de NODD ${run.slug}: plan no llegó a escribir spec.md, así que vuelve a ${run.expected} sin clarify · modo ${run.mode} · cap ${run.cap} · perfil ${config.profile}\nartefactos: ${run.dir}`, started: true }
+  return { text: `adopto el handoff de NODD ${run.slug}: arranca en ${run.expected} sin clarify · modo ${run.mode} · cap ${run.cap} · perfil ${config.profile}\nartefactos: ${run.dir}`, started: true }
 }
 
 async function statusText($: any) {
@@ -674,7 +744,7 @@ async function statusText($: any) {
     lines.push(`  ${p.padEnd(9)} ${config.skip.includes(p) ? '(salteada) ' : ''}${config.models[p]} · effort ${config.efforts[p]}  → ${routeFor(config.models[p]).kind === 'cpam' ? 'CPAM' : 'Claude Code'}`)
   if (!run) return lines.concat('sin runs en esta sesión').join('\n')
   lines.push(
-    `run ${run.slug} · ${STATUS_LABEL[run.status]} · ronda ${run.verdicts.length}/${run.cap} · ${run.verdicts.join(' → ') || 'sin veredictos'} · analyze ${run.decisions.join(' → ') || '—'} · ${mmss((run.endedAt || now()) - run.startedAt)}`,
+    `run ${run.slug}${run.origin === 'nodd' ? ' · desde NODD' : ''} · ${STATUS_LABEL[run.status]} · ronda ${run.verdicts.length}/${run.cap} · ${run.verdicts.join(' → ') || 'sin veredictos'} · analyze ${run.decisions.join(' → ') || '—'} · ${mmss((run.endedAt || now()) - run.startedAt)}`,
   )
   for (const p of run.order) {
     const s = run.stats[p]
@@ -1193,6 +1263,7 @@ function drawPane($: any, e: any) {
     const elapsed = mmss((run.endedAt || now()) - run.startedAt)
     out.push(
       card('run', `RUN · ${run.slug}`, C.violet, [
+        ...(run.origin === 'nodd' ? [t([s('↳ desde NODD · requirements.md · sin clarify', C.pink)])] : []),
         t([s(clip(run.request, cols * 2), C.text)]),
         t([
           s('ronda ', C.muted),
@@ -1362,7 +1433,7 @@ export function register(on: any) {
         .register({
           name: 'forge',
           description: 'SDD clarify → explore → plan → analyze → build → veredicto, cada fase en su modelo del CPAM',
-          argumentHint: '<pedido> | stop | status | continue | ui | profile [n|new n|save n|delete n|reset n] | model <fase> <id> | effort <fase> <nivel> | phase <clarify|analyze> <on|off> | mode <m> | cap <n>',
+          argumentHint: '<pedido> | stop | status | continue [<slug>] | ui | profile [n|new n|save n|delete n|reset n] | model <fase> <id> | effort <fase> <nivel> | phase <clarify|analyze> <on|off> | mode <m> | cap <n>',
           immediate: true,
         })
         .catch((err: any) => $.ui.log(`forge: /forge no registrado: ${err}`, { to: 'debug' }))
@@ -1386,17 +1457,12 @@ export function register(on: any) {
       return {}
     }
     if (sub === 'continue' || sub === 'seguir') {
-      if (!run || !run.expected || (run.status !== 'parado' && run.status !== 'cortado')) return { text: 'no hay un run parado para seguir' }
-      run.status = 'running'
-      run.note = ''
-      run.endedAt = undefined
-      run.flights = {}
-      if (run.unit) Object.assign(run.unit, { claimed: [], results: {} })
-      run.stats[run.expected] = blankStat(config.models[run.expected], config.efforts[run.expected])
-      await persist($)
-      await showRun($)
-      launch($)
-      return { text: `sigo ${run.slug} desde ${run.expected}` }
+      const res = await continueRun($, args)
+      if (res.started) {
+        await showRun($)
+        launch($)
+      }
+      return { text: res.text }
     }
     const text = await commandText($, args)
     if (text !== undefined) return { text }
@@ -1411,6 +1477,11 @@ export function register(on: any) {
     const m = /^\s*\/forge(?:\s+([\s\S]*))?$/.exec(String(e.text || ''))
     if (!m || !headless) return next(e)
     const args = String(m[1] || '').trim()
+    if (parseContinue(args)) {
+      const res = await continueRun($, args)
+      if (!res.started || !run?.expected) return { drop: `forge: ${res.text}`.replace(/\n\s*/g, ' | ') }
+      return next({ ...e, text: startInstruction(run.slug, run.expected) })
+    }
     const text = await commandText($, args)
     if (text !== undefined) return { drop: text.replace(/\n\s*/g, ' | ') }
     const res = await startRun($, args)
@@ -1499,6 +1570,7 @@ export function register(on: any) {
         tdd: run.tdd,
         adjust: run.adjust,
         retryReason: run.retryReason,
+        handoff: run.origin === 'nodd',
       }),
     }
     delete input.model

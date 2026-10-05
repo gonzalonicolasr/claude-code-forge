@@ -154,6 +154,7 @@ export function briefFor(p: {
   tdd?: 'strict' | 'off'
   adjust?: string
   retryReason?: string
+  handoff?: boolean
 }): string {
   const lines = [
     `forge run \`${p.slug}\` · phase **${p.phase}**${p.phase === 'build' || p.phase === 'veredicto' ? ` · round ${p.round}/${p.cap}` : ''}${p.batch ? ` · batch ${p.batch.index + 1}/${p.batch.total}` : ''}${p.wave ? ` · parallel wave ${p.wave.index + 1}/${p.wave.total} · task ${p.wave.task}` : ''}`,
@@ -169,6 +170,12 @@ export function briefFor(p: {
   ]
   if (p.phase === 'clarify') lines.push('', `Run mode: ${p.mode || 'automatic'}.${p.mode === 'interactive' ? ' A blocking question will be shown to the user.' : ' Nobody can answer questions: assume and return continue.'}`)
   if (p.clarified && p.phase !== 'clarify' && p.phase !== 'build') lines.push('', `Clarify assumptions: ${p.dir}/clarifications.md.`)
+  if (p.handoff && (p.phase === 'explore' || p.phase === 'plan'))
+    lines.push(
+      '',
+      `This run adopts a NODD handoff: the feature request is ${p.dir}/requirements.md, written by /nodd-promote (copied verbatim to request.md). There is no clarify phase: its Objective, Scope and Constraints are already settled.`,
+      `The items under "Already resolved — do not redo" in requirements.md are context, not work: they are done and verified. Do not ${p.phase === 'plan' ? 're-plan, redo or re-implement them, and write no task for them' : 'investigate them as pending work'}; ${p.phase === 'plan' ? 'plan only the "Remaining work"' : 'focus on what the "Remaining work" needs'}.`,
+    )
   if (p.phase === 'plan') lines.push('', `Read ${p.dir}/findings.md first.`)
   if (p.phase === 'build') lines.push('', `Read ${p.dir}/design.md and ${p.dir}/tasks.md first.`)
   if (p.batch) lines.push('', `Batch ${p.batch.index + 1}/${p.batch.total}: implement ONLY tasks ${p.batch.tasks.join(', ')}, then return. Do not start a task until its depends: entries are [x].`)

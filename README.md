@@ -20,13 +20,15 @@ claude --plugin-dir ~/projects/forge
 | `/forge` o `/forge ui` | Abre el panel FORGE (con NERV cargado, un run nuevo no lo abre solo: se sigue en la pestaña FORGE de NERV) |
 | `/forge status` | Modelos por fase, estado del run, tiempos y tokens |
 | `/forge stop` | Corta el run (funciona en medio de un turno) |
-| `/forge continue` | Retoma un run parado o cortado desde la fase que faltaba |
+| `/forge continue [<slug>]` (o `seguir`) | Retoma un run parado o cortado desde la fase que faltaba. Con `<slug>`, o sin slug y sin run parado, **adopta un handoff de NODD** (ver abajo). Acepta `--auto` / `--interactive`, `--cap N` y `--profile` para el run adoptado |
 | `/forge profile [nombre]` · `/forge profile save <nombre>` · `/forge profile delete <nombre>` | Ver, activar, guardar o borrar perfiles (los de fábrica no se borran) |
 | `/forge model <fase> <modelo>` | Cambia el modelo de una fase (`clarify`, `explore`, `plan`, `analyze`, `build`, `veredicto`) |
 | `/forge phase <clarify\|analyze> <on\|off>` | Activa o saltea uno de los dos gates (en el panel: botón *saltear* / *activar*). Las otras cuatro fases no se pueden saltear |
 | `/forge effort <fase> <nivel>` | Cambia el effort de una fase: `auto` (no toca nada), `off`, `minimal`, `low`, `medium`, `high`, `xhigh` (los niveles de pi/zero-pi) |
 | `/forge mode <interactive\|automatic\|ask>` | Modo por defecto. `ask` (o `preguntar`) lo consulta al arrancar |
 | `/forge cap <n>` | Tope de rondas por defecto (3) |
+
+**Handoff desde NODD** (contrato en `zero-pi/docs/forge-contract.md`, sección *Handoff desde NODD*): `/nodd-promote <slug>` deja un solo archivo, `.sdd/<slug>/requirements.md`, con la línea `Promoted from the NODD run`. Un directorio es un handoff cuando tiene ese `requirements.md` y no tiene `run.json`, `execution.json`, `design.md`, `tasks.md` ni `request.md` (`noddHandoffProblem` en `logic.ts`). `/forge continue <slug>` lo **adopta**: abre un run con ese mismo slug y directorio, copia `requirements.md` a `request.md` byte a byte, **saltea clarify** (no hay línea `Size:` ni aviso de NODD) y arranca en explore; después sigue igual que cualquier run. Los briefs de explore y plan nombran `requirements.md` y aclaran que lo de *Already resolved — do not redo* es contexto ya hecho, no trabajo. El run queda marcado con `origin: "nodd"` en `run.json` y en `state.json`, y el panel lo muestra (`↳ desde NODD`). Sin slug: si no hay un run parado, adopta el único handoff de `.sdd/`; si hay varios, los lista; si no hay ninguno, dice lo de siempre. Un directorio que no es handoff no se adopta y forge dice por qué. Si un run adoptado se corta antes de que plan escriba `spec.md` y el mod se recargó (ya no está en memoria), `/forge continue <slug>` lo retoma **desde explore**, sin clarify, conservando `routing.log`; con `spec.md` escrito no se retoma así. En `claude -p`, `/forge continue <slug>` hace lo mismo y reescribe el prompt con la llamada a explore.
 
 **Modo interactive:** después de cada fase aparece «¿Seguimos con X?» con *Continuar* / *Parar*. Lo que escribas en *Other* se le pasa como ajuste a la fase siguiente.
 
@@ -87,17 +89,18 @@ forge lo reescribe en cada cambio de configuración y en cada paso de un run (no
   "run": null | { "status": "running|paused|pasa|no-verificado|bloqueado|falló|parado", "request", "slug", "round", "cap", "phase",
     "phaseOrder": [], "startedAt", "endedAt", "batch": null | { "index", "total", "tasks": ["T002"], "parallel"?: true },
     "phases": [{ "name", "status": "pending|running|done|failed", "model", "effort", "responded", "ms", "startedAt", "tokensIn", "tokensOut", "steps" }],
-    "verdicts": [], "decisions": ["replan", "continue"], "size": null | "small" | "normal" },
+    "verdicts": [], "decisions": ["replan", "continue"], "size": null | "small" | "normal", "origin": null | "nodd" },
   "updatedAt" }
 ```
 
-`phaseOrder` (arriba) es el orden activo de la configuración: sin las fases salteadas. `run.phaseOrder` y `run.phases` son las del run en curso, en orden (un run arrancado con clarify salteado no la lista). `paused` es la pausa entre fases del modo interactive, mientras espera *Continuar* / *Parar* (o la respuesta a una pregunta bloqueante de clarify). `bloqueado` es el segundo `replan` de analyze. `decisions` son las decisiones de analyze en orden, `size` el tamaño que marcó clarify (`null` antes de clarify o con clarify salteado, que cuenta como `normal`) y `batch` la unidad de build en curso (índice desde 1): un lote secuencial, o una tanda paralela con `parallel: true` y en `tasks` todas las tareas de la tanda. El catálogo saca las cuentas excluidas y los modelos de imagen, y suma el grupo `claude` (haiku/sonnet/opus/fable de tu plan). Si hay dos sesiones con forge abiertas, la última que escribe gana.
+`phaseOrder` (arriba) es el orden activo de la configuración: sin las fases salteadas. `run.phaseOrder` y `run.phases` son las del run en curso, en orden (un run arrancado con clarify salteado no la lista). `paused` es la pausa entre fases del modo interactive, mientras espera *Continuar* / *Parar* (o la respuesta a una pregunta bloqueante de clarify). `bloqueado` es el segundo `replan` de analyze. `decisions` son las decisiones de analyze en orden, `size` el tamaño que marcó clarify (`null` antes de clarify o con clarify salteado, que cuenta como `normal`) y `origin` vale `"nodd"` cuando el run adoptó un handoff de NODD, y `batch` la unidad de build en curso (índice desde 1): un lote secuencial, o una tanda paralela con `parallel: true` y en `tasks` todas las tareas de la tanda. El catálogo saca las cuentas excluidas y los modelos de imagen, y suma el grupo `claude` (haiku/sonnet/opus/fable de tu plan). Si hay dos sesiones con forge abiertas, la última que escribe gana.
 
 ## Artefactos (`.sdd/<slug>/` del repo de trabajo)
 
 | Archivo | Lo escribe |
 |---|---|
-| `request.md` | forge, el pedido textual |
+| `request.md` | forge, el pedido textual (en un run adoptado de NODD, copia exacta de `requirements.md`) |
+| `requirements.md` | NODD (`/nodd-promote`): forge sólo lo lee para adoptar el handoff |
 | `clarifications.md` | forge, con la respuesta de clarify (`## Status`, `## Size` con la línea exacta `Size: small\|normal`, `## Assumptions`, `## Non-blocking decisions`, `## Blocking questions`) y, si estaba bloqueado, un `## Resolution` con lo que contestaste o con la nota de modo automatic |
 | `findings.md` | forge, con la respuesta de explore |
 | `proposal.md`, `spec.md`, `design.md`, `tasks.md` | la fase plan (forge valida `tasks.md` como `/zero-validate`: cada `T###` con `files`, `depends`, `evidence` y `review`, y dependencias hacia atrás) |
@@ -151,7 +154,7 @@ El veredicto tiene que terminar en `VEREDICTO: pasa|corregir|replantear` (`parse
 
 ```bash
 claude plugin validate . --strict   # limpio
-claude plugin test                   # 58 tests: ruteo, catálogo y orden de modelos, effort (sufijo y n/a), perfiles de fábrica y de zero-pi con seis fases, parseo del veredicto, Status y Size de clarify y Decision de analyze, el aviso de NODD para pedidos chicos (automatic, interactive y normal), transiciones (orden de seis fases, fases salteadas, replan y bloqueo, cap), validación de tareas, lotes de build y tandas paralelas (`nextWave`, `planUnits`, tildado y evidencia, y el hook `tool.call` con tres llamadas simultáneas, una de más, un hijo que falla, segundo plano y menos llamadas que las pedidas), slug y banderas, limpieza de mensajes, render del panel y state.json
+claude plugin test                   # 70 tests: ruteo, catálogo y orden de modelos, effort (sufijo y n/a), perfiles de fábrica y de zero-pi con seis fases, parseo del veredicto, Status y Size de clarify y Decision de analyze, el aviso de NODD para pedidos chicos (automatic, interactive y normal), transiciones (orden de seis fases, fases salteadas, replan y bloqueo, cap), validación de tareas, lotes de build y tandas paralelas (`nextWave`, `planUnits`, tildado y evidencia, y el hook `tool.call` con tres llamadas simultáneas, una de más, un hijo que falla, segundo plano y menos llamadas que las pedidas), slug y banderas, handoff de NODD (`noddHandoffProblem`, `parseContinue`, briefs, y por los hooks: adoptar, rechazar un directorio que no es handoff, `continue` sin slug con uno o varios handoffs, el `continue` de siempre con un run parado, `claude -p`, y retomar un run adoptado desde memoria, desde disco antes de `spec.md` y tras recuperarlo de `run.json`), limpieza de mensajes, render del panel y state.json
 ```
 
 Archivos: `hooks/register.ts` (hooks y panel), `hooks/logic.ts` (lógica pura testeable), `hooks/prompts.ts` (prompts de fase adaptados de zero-pi, briefs e instrucciones al despachante), `hooks/forge.test.ts`.
@@ -164,7 +167,7 @@ Archivos: `hooks/register.ts` (hooks y panel), `hooks/logic.ts` (lógica pura te
   - `/zero-checkpoint` antes de cada build (parche de restauración en `.sdd/<slug>/checkpoints/`).
   - El ledger de ejecución (`zero_execution`: `execution.json`, `.sdd/.executions/`, intentos y recibos por fase) y el reporte de costo al final (`/zero-cost`).
   - La validación de `spec.md` (bloques `### REQ:` con `Acceptance criteria`) y el chequeo del total de `## Review Workload`: forge sólo valida la estructura de las tareas.
-  - El algoritmo de reanudación por artefactos (`/forge --continue` que detecta en qué fase quedó un run viejo) y la pregunta ante un slug existente: forge siempre arranca un slug nuevo y `continue` sólo retoma el run de la sesión.
+  - El algoritmo de reanudación por artefactos (`/forge --continue` que detecta en qué fase quedó un run viejo) y la pregunta ante un slug existente: forge siempre arranca un slug nuevo y `continue` sólo retoma el run de la sesión, adopta un handoff de NODD o retoma desde explore un run adoptado que se cortó antes de `spec.md`.
   - La memoria del run en Cortex, las métricas en `~/.pi/zero-runs.jsonl`, el archivado de specs (`spec-merge`) y los comandos de git/PR/issue.
   - El `cap` de `.sdd/config.json` (`rounds.cap`): forge usa el suyo.
 - zero-pi no deja saltear clarify ni analyze; forge sí, a pedido (`/forge phase … off`). Por defecto corren las seis.
