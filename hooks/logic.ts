@@ -166,6 +166,13 @@ export function parseClarifyStatus(text: string): 'continue' | 'blocked' | undef
   return m ? (m[1]!.toLowerCase() as 'continue' | 'blocked') : undefined
 }
 
+export type Size = 'small' | 'normal'
+
+export function parseSize(text: string): Size {
+  const all = [...String(text || '').matchAll(/^[\s>*_`-]*size[\s*_`]*:[\s*_`]*(small|normal)[\s*_`.]*$/gim)]
+  return all.length && all[all.length - 1]![1]!.toLowerCase() === 'small' ? 'small' : 'normal'
+}
+
 export function phaseAnswerOk(phase: Phase, text: string): boolean {
   const t = String(text || '').trim()
   if (/\bSubagentHandback\b/.test(t)) return false
@@ -226,17 +233,48 @@ export function advance(phase: Phase, outcome: Outcome, ctx: { rounds: number; c
   return next ? { next, status: 'running' } : { status: 'fallido' }
 }
 
-export type TaskItem = { id: string; done: boolean; files: number; depends: string[] | null; evidence: string; review: number | null; reviewRaw: string | null }
+export type TaskItem = { id: string; done: boolean; files: number; depends: string[] | null; evidence: string; review: number | null; reviewRaw: string | null; paths?: string[]; parallel?: boolean }
 
-export function parseTasks(text: string): TaskItem[] {
+export function normalizePath(path: string, root = ''): string {
+  const p = String(path || '').trim().replace(/\s*\((?:new|nuevo)\)\s*$/i, '').trim()
+  if (!p) return ''
+  const abs = p.startsWith('/')
+  const out: string[] = []
+  for (const seg of p.split('/')) {
+    if (!seg || seg === '.') continue
+    if (seg === '..' && out.length && out[out.length - 1] !== '..') out.pop()
+    else if (seg !== '..' || !abs) out.push(seg)
+  }
+  const norm = (abs ? '/' : '') + out.join('/')
+  const r = root ? normalizePath(root) : ''
+  return r && r !== '/' && norm.startsWith(`${r}/`) ? norm.slice(r.length + 1) : norm
+}
+
+export function samePath(a: string, b: string): boolean {
+  return a === b || a.endsWith(`/${b}`) || b.endsWith(`/${a}`)
+}
+
+function filePaths(value: string, root: string): string[] {
+  const ticks = value.match(/`[^`]+`/g)
+  const raw = ticks ? ticks.map((t) => t.slice(1, -1)) : value.split(',')
+  return raw.map((p) => normalizePath(p, root)).filter(Boolean)
+}
+
+function taskHeader(line: string): { id: string; done: boolean } | undefined {
+  const m = /^\s*- \[([ xX])\]\s+\**(T\d{3,})\b/.exec(line) || /^#{2,3}\s+\[([ xX])\]\s+(T\d{3,})\b/.exec(line)
+  if (m) return { id: m[2]!, done: m[1] !== ' ' }
+  const h = /^###\s+(T\d{3,})\b(?:\s+[—-]\s+\[([ xX])\])?/.exec(line)
+  return h ? { id: h[1]!, done: !!h[2] && h[2] !== ' ' } : undefined
+}
+
+export function parseTasks(text: string, root = ''): TaskItem[] {
   const tasks: TaskItem[] = []
   let cur: TaskItem | undefined
   let collecting = false
   for (const line of String(text || '').split(/\r?\n/)) {
-    const head =
-      /^\s*- \[([ xX])\]\s+\**(T\d{3,})\b/.exec(line) || /^#{2,3}\s+\[([ xX])\]\s+(T\d{3,})\b/.exec(line) || /^###\s+()(T\d{3,})\b/.exec(line)
+    const head = taskHeader(line)
     if (head) {
-      cur = { id: head[2]!, done: /x/i.test(head[1] || ''), files: 0, depends: null, evidence: '', review: null, reviewRaw: null }
+      cur = { id: head.id, done: head.done, files: 0, depends: null, evidence: '', review: null, reviewRaw: null, paths: [], parallel: /\[P\]/.test(line) }
       tasks.push(cur)
       collecting = false
       continue
@@ -244,14 +282,18 @@ export function parseTasks(text: string): TaskItem[] {
     if (!cur) continue
     const field = /^\s*-\s+(files|depends|evidence|review):\s*(.*)$/.exec(line)
     if (!field) {
-      if (collecting && /^\s*(-\s+)?`[^`]+`/.test(line)) cur.files += (line.match(/`[^`]+`/g) || []).length
-      else if (collecting && line.trim()) collecting = false
+      if (collecting && /^\s*(-\s+)?`[^`]+`/.test(line)) {
+        cur.files += (line.match(/`[^`]+`/g) || []).length
+        cur.paths!.push(...filePaths(line, root))
+      } else if (collecting && line.trim()) collecting = false
       continue
     }
     collecting = field[1] === 'files'
     const value = (field[2] || '').trim()
-    if (field[1] === 'files') cur.files = (value.match(/`[^`]+`/g) || []).length || (value ? 1 : 0)
-    else if (field[1] === 'depends') cur.depends = /^(\[\s*\]|none|n\/a|-)?$/i.test(value) ? [] : [...new Set(value.match(/\bT\d+\b/g) || [])]
+    if (field[1] === 'files') {
+      cur.files = (value.match(/`[^`]+`/g) || []).length || (value ? 1 : 0)
+      cur.paths = filePaths(value, root)
+    } else if (field[1] === 'depends') cur.depends = /^(\[\s*\]|none|n\/a|-)?$/i.test(value) ? [] : [...new Set(value.match(/\bT\d+\b/g) || [])]
     else if (field[1] === 'evidence') cur.evidence = value
     else {
       cur.reviewRaw = value
@@ -302,6 +344,88 @@ export function buildBatches(tasks: readonly TaskItem[]): string[][] {
   }
   if (cur.length) out.push(cur)
   return out
+}
+
+export const PARALLEL_MAX = 3
+export type BuildUnit = { tasks: string[]; parallel: boolean }
+
+function waveFrom(lead: TaskItem, rest: readonly TaskItem[], ready: (t: TaskItem) => boolean): string[] {
+  if (!lead.parallel || !lead.paths?.length) return [lead.id]
+  const wave = [lead.id]
+  const used = [...lead.paths]
+  for (const t of rest) {
+    if (wave.length >= PARALLEL_MAX) break
+    if (!t.parallel || !t.paths?.length || !ready(t) || t.paths.some((p) => used.some((u) => samePath(p, u)))) continue
+    wave.push(t.id)
+    used.push(...t.paths)
+  }
+  return wave
+}
+
+export function nextWave(tasks: readonly TaskItem[]): BuildUnit | undefined {
+  const open = tasks.filter((t) => !t.done)
+  if (!open.length) return undefined
+  const done = new Set(tasks.filter((t) => t.done).map((t) => t.id))
+  const readyWith = (extra: ReadonlySet<string>) => (t: TaskItem) => (t.depends || []).every((d) => done.has(d) || extra.has(d))
+  const ready = readyWith(new Set())
+  const at = Math.max(0, open.findIndex(ready))
+  const first = open[at]!
+  const wave = waveFrom(first, open.slice(at + 1), ready)
+  if (wave.length > 1) return { tasks: wave, parallel: true }
+  const batch = [first.id]
+  let lines = first.review ?? 0
+  for (let i = at + 1; i < open.length; i++) {
+    const t = open[i]!
+    const est = t.review ?? 0
+    if (batch.length >= BATCH_TASKS || lines + est > BATCH_LINES) break
+    const ok = readyWith(new Set(batch))
+    if (!ok(t)) break
+    if (t.parallel && waveFrom(t, open.slice(i + 1), ok).length > 1) break
+    batch.push(t.id)
+    lines += est
+  }
+  return { tasks: batch, parallel: false }
+}
+
+export function planUnits(tasks: readonly TaskItem[]): BuildUnit[] {
+  const view = tasks.map((t) => ({ ...t }))
+  const out: BuildUnit[] = []
+  for (let u = nextWave(view); u && out.length <= view.length; u = nextWave(view)) {
+    out.push(u)
+    for (const t of view) if (u.tasks.includes(t.id)) t.done = true
+  }
+  return out
+}
+
+export function tickTasks(text: string, ids: readonly string[]): string {
+  return String(text || '')
+    .split('\n')
+    .map((line) => {
+      const m = /^(\s*- |#{2,3}\s+)\[ \](\s+\**(T\d{3,})\b.*)$/.exec(line)
+      if (m) return ids.includes(m[3]!) ? `${m[1]}[x]${m[2]}` : line
+      const h = /^(###\s+(T\d{3,})\s+[—-]\s+)(?:\[ \]\s*)?(?!\[[xX]\])(.*)$/.exec(line)
+      return h && ids.includes(h[2]!) ? `${h[1]}[x] ${h[3]}` : line
+    })
+    .join('\n')
+}
+
+export function waveEvidence(n: number, entries: readonly { id: string; text?: string }[]): string {
+  return [...entries]
+    .sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true }))
+    .map((e) => `## ${e.id} (parallel wave ${n})\n\n${String(e.text || '').trim() || `_No tdd-evidence/${e.id}.md was written._`}`)
+    .join('\n\n')
+}
+
+export type WaveResult = { ok: boolean; text: string; reason?: string }
+
+export function waveEnvelope(index: number, total: number, tasks: readonly string[], results: Readonly<Record<string, WaveResult>>): string {
+  const parts = [`## Wave ${index}/${total}: ${tasks.join(', ')}`]
+  for (const id of tasks) {
+    const r = results[id]
+    if (!r) continue
+    parts.push(`### ${id}${r.ok ? '' : ` (failed: ${r.reason || 'no result'})`}`, String(r.text || '').trim() || '(no envelope)')
+  }
+  return parts.join('\n\n')
 }
 
 export function slugify(text: string, taken: readonly string[] = []): string {
@@ -489,7 +613,8 @@ export type RunView = {
   stats: Record<Phase, PhaseStat>
   verdicts: Verdict[]
   decisions?: Decision[]
-  batch?: { index: number; total: number; tasks: string[] }
+  size?: Size
+  batch?: { index: number; total: number; tasks: string[]; parallel?: boolean }
 }
 export type StateInput = {
   version: string
@@ -550,7 +675,7 @@ export function stateSnapshot(i: StateInput) {
         phaseOrder: [...i.run.order],
         startedAt: i.run.startedAt,
         endedAt: i.run.endedAt ?? null,
-        batch: i.run.batch ? { index: i.run.batch.index + 1, total: i.run.batch.total, tasks: [...i.run.batch.tasks] } : null,
+        batch: i.run.batch ? { index: i.run.batch.index + 1, total: i.run.batch.total, tasks: [...i.run.batch.tasks], ...(i.run.batch.parallel ? { parallel: true } : {}) } : null,
         phases: i.run.order.map((name) => {
           const s = i.run!.stats[name]
           return {
@@ -568,6 +693,7 @@ export function stateSnapshot(i: StateInput) {
         }),
         verdicts: [...i.run.verdicts],
         decisions: [...(i.run.decisions || [])],
+        size: i.run.size ?? null,
       }
     : null
   return {

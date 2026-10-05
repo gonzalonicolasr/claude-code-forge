@@ -1,5 +1,6 @@
 import { expect, test, describe, mock } from 'claude-code/testing'
-import { zeroTarget, aliasOf, editZeroProfile, profileName, builtinModified, routeFor, phaseOfAgentType, parseVerdict, advance, slugify, parseStart, modelCatalog, groupOf, cleanMessages, thinkingByTool, stateSnapshot, exportStatus, DEFAULT_PROFILES, DEFAULT_EFFORTS, BUILTIN_PROFILES, cpamModel, claudeEffort, compareModels, zeroProfiles, isExcluded, effortBlocked, groupLabel, PHASES, phaseOrder, parseDecision, parseClarifyStatus, pickAnswer, forgeMayRun, modelUnavailable, section, parseTasks, validateTasks, buildBatches } from './logic.ts'
+import { zeroTarget, aliasOf, editZeroProfile, profileName, builtinModified, routeFor, phaseOfAgentType, parseVerdict, advance, slugify, parseStart, modelCatalog, groupOf, cleanMessages, thinkingByTool, stateSnapshot, exportStatus, DEFAULT_PROFILES, DEFAULT_EFFORTS, BUILTIN_PROFILES, cpamModel, claudeEffort, compareModels, zeroProfiles, isExcluded, effortBlocked, groupLabel, PHASES, phaseOrder, parseDecision, parseClarifyStatus, pickAnswer, forgeMayRun, modelUnavailable, section, parseTasks, validateTasks, buildBatches, nextWave, planUnits, normalizePath, samePath, tickTasks, waveEvidence, waveEnvelope, PARALLEL_MAX, parseSize } from './logic.ts'
+import { PHASE_PROMPTS, finalInstruction, NODD_HINT } from './prompts.ts'
 
 describe('ruteo', () => {
   test('los tipos forge:<fase> se reconocen y el resto no', () => {
@@ -187,6 +188,27 @@ describe('gates y tareas', () => {
     expect(parseClarifyStatus('sin estado')).toBe(undefined)
   })
 
+  test('lee el Size de clarify: small sólo con la línea exacta, cualquier otra cosa es normal', () => {
+    expect(parseSize('## Status\ncontinue\n\n## Size\nSize: small\n')).toBe('small')
+    expect(parseSize('Size: normal')).toBe('normal')
+    expect(parseSize('**Size:** `small`')).toBe('small')
+    expect(parseSize('Size: small\n...\nSize: normal')).toBe('normal')
+    expect(parseSize('## Status\ncontinue')).toBe('normal')
+    expect(parseSize('Size: smallish')).toBe('normal')
+    expect(parseSize('Size: small or normal')).toBe('normal')
+    expect(parseSize('the size: small change')).toBe('normal')
+    expect(parseSize('')).toBe('normal')
+  })
+
+  test('clarify pide la línea Size y el cierre recomienda NODD sólo si el pedido fue chico', () => {
+    expect(PHASE_PROMPTS.clarify).toContain('`Size: small` or `Size: normal`')
+    expect(PHASE_PROMPTS.clarify).toContain('When in doubt, `Size: normal`')
+    expect(finalInstruction('x', 'small')).toContain(NODD_HINT)
+    expect(NODD_HINT).toContain('https://nodd.com.ar')
+    expect(finalInstruction('x', 'normal')).not.toContain('NODD')
+    expect(finalInstruction('x')).not.toContain('NODD')
+  })
+
   test('reconoce cuando el CPAM dice que un modelo no está disponible, y nada más', () => {
     expect(modelUnavailable(`HTTP 400: {"detail":"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}`)).toBe(true)
     expect(modelUnavailable('HTTP 404: model_not_found')).toBe(true)
@@ -271,6 +293,366 @@ describe('gates y tareas', () => {
     const many = Array.from({ length: 6 }, (_, i) => ({ id: `T00${i + 1}`, done: false, files: 1, depends: [], evidence: 'x', review: null, reviewRaw: null }))
     expect(buildBatches(many)).toEqual([['T001', 'T002', 'T003', 'T004'], ['T005', 'T006']])
     expect(buildBatches([{ id: 'T001', done: false, files: 1, depends: [], evidence: 'x', review: 1200, reviewRaw: '~1200' }])).toEqual([['T001']])
+  })
+})
+
+describe('tandas paralelas', () => {
+  const task = (id: string, o: { p?: boolean; files?: string; depends?: string; review?: number; done?: boolean } = {}) =>
+    [`- [${o.done ? 'x' : ' '}] ${id} — tarea ${id}${o.p ? ' [P]' : ''}`, `  - files: ${o.files ?? `\`/r/${id}.js\``}`, `  - depends: [${o.depends ?? ''}]`, '  - evidence: `node --test` passes', `  - review: ~${o.review ?? 100} changed lines`].join('\n')
+  const doc = (...ts: string[]) => ts.join('\n')
+  const units = (text: string, root = '/r') => planUnits(parseTasks(text, root)).map((u) => (u.parallel ? `P:${u.tasks.join(',')}` : u.tasks.join(',')))
+
+  test('parseTasks guarda los paths normalizados y la marca [P] de la cabecera', () => {
+    const t = parseTasks(doc(task('T001', { p: true, files: '`src/a.ts` (new), `./src/a.test.ts`' }), task('T002', { files: 'lib/b.ts (new), /abs/c.ts' })), '/r')
+    expect(t.map((x) => [x.id, x.parallel, x.paths, x.files])).toEqual([
+      ['T001', true, ['src/a.ts', 'src/a.test.ts'], 2],
+      ['T002', false, ['lib/b.ts', '/abs/c.ts'], 1],
+    ])
+    expect(parseTasks('- [ ] T001 — x\n  - files:\n    - `src/x.ts` (new)\n    - `/r/y/../z.ts`\n  - depends: []')[0]!.paths).toEqual(['src/x.ts', '/r/z.ts'])
+    expect([normalizePath('a/./b.ts (new)', '/r/'), normalizePath('/r/x/../y.ts', '/r'), normalizePath('/otro/y.ts', '/r')]).toEqual(['a/b.ts', 'y.ts', '/otro/y.ts'])
+    expect([samePath('src/a.ts', '/x/src/a.ts'), samePath('a.ts', 'ba.ts')]).toEqual([true, false])
+    expect(parseTasks(['### T001 — [x] hecha', '### T002 — [ ] pendiente', '### T003 — sin caja [P]', '## [x] T004 — b', '- [x] **T005. c**'].join('\n')).map((t) => [t.id, t.done, t.parallel])).toEqual([
+      ['T001', true, false],
+      ['T002', false, false],
+      ['T003', false, true],
+      ['T004', true, false],
+      ['T005', true, false],
+    ])
+  })
+
+  test('sin [P] los lotes quedan iguales que siempre', () => {
+    const text = doc(task('T001', { review: 300, done: true }), task('T002', { depends: 'T001', review: 500 }), task('T003', { depends: 'T002', review: 400 }), task('T004'))
+    expect(planUnits(parseTasks(text)).map((u) => u.tasks)).toEqual(buildBatches(parseTasks(text)))
+    expect(nextWave(parseTasks(text))).toEqual({ tasks: ['T002'], parallel: false })
+    const six = doc(...Array.from({ length: 6 }, (_, i) => task(`T00${i + 1}`)))
+    expect(units(six)).toEqual(['T001,T002,T003,T004', 'T005,T006'])
+    expect(nextWave(parseTasks(doc(task('T001', { done: true }))))).toBe(undefined)
+  })
+
+  test('tres [P] con archivos distintos van juntas', () => {
+    expect(units(doc(task('T001', { p: true }), task('T002', { p: true }), task('T003', { p: true }), task('T004', { depends: 'T001, T002, T003' })))).toEqual(['P:T001,T002,T003', 'T004'])
+  })
+
+  test('si dos se pisan en un archivo, la segunda queda para después', () => {
+    const text = doc(task('T001', { p: true, files: '`/r/a.js`' }), task('T002', { p: true, files: '`/r/a.js`, `/r/b.js`' }), task('T003', { p: true, files: '`/r/c.js`' }))
+    expect(units(text)).toEqual(['P:T001,T003', 'T002'])
+  })
+
+  test('una [P] que depende de otra de la misma tanda no entra', () => {
+    const text = doc(task('T001', { p: true }), task('T002', { p: true, depends: 'T001' }), task('T003', { p: true }))
+    expect(units(text)).toEqual(['P:T001,T003', 'T002'])
+    expect(units(doc(task('T001', { p: true }), task('T002', { p: true, depends: 'T001' })))).toEqual(['T001,T002'])
+  })
+
+  test('si la primera no tiene [P] corre sola en su lote y la tanda sale después', () => {
+    const text = doc(task('T001'), task('T002', { p: true }), task('T003', { p: true }), task('T004'))
+    expect(units(text)).toEqual(['T001', 'P:T002,T003', 'T004'])
+    expect(nextWave(parseTasks(text))).toEqual({ tasks: ['T001'], parallel: false })
+  })
+
+  test('un lote secuencial se corta antes de una tarea cuyas depends no están hechas ni en el lote', () => {
+    expect(nextWave(parseTasks(doc(task('T001', { depends: 'T009' }), task('T002'), task('T003', { depends: 'T001' }))))).toEqual({ tasks: ['T002'], parallel: false })
+    expect(nextWave(parseTasks(doc(task('T001'), task('T002', { depends: 'T001' }))))).toEqual({ tasks: ['T001', 'T002'], parallel: false })
+  })
+
+  test('el tope es de tres tareas por tanda', () => {
+    expect(PARALLEL_MAX).toBe(3)
+    expect(units(doc(...['T001', 'T002', 'T003', 'T004', 'T005'].map((id) => task(id, { p: true }))))).toEqual(['P:T001,T002,T003', 'P:T004,T005'])
+  })
+
+  test('(new), ./ y paths relativos se normalizan contra el code root antes de comparar', () => {
+    const text = doc(task('T001', { p: true, files: '`src/a.ts` (new)' }), task('T002', { p: true, files: '`/r/src/a.ts`' }), task('T003', { p: true, files: '`./src/b.ts`' }))
+    expect(units(text)).toEqual(['P:T001,T003', 'T002'])
+    expect(units(text, '/otro')).toEqual(['P:T001,T003', 'T002'])
+    expect(units(doc(task('T001', { p: true, files: '`/r/src/a.ts`' }), task('T002', { p: true, files: '`/r/lib/a.ts`' })))).toEqual(['P:T001,T002'])
+  })
+
+  test('las hechas cuentan como dependencias cumplidas y una tarea sin files no comparte tanda', () => {
+    const text = doc(task('T001', { done: true }), task('T002', { p: true, depends: 'T001' }), task('T003', { p: true, files: '' }), task('T004', { p: true }))
+    expect(units(text)).toEqual(['P:T002,T004', 'T003'])
+  })
+
+  test('tilda las tareas entregadas en tasks.md y nada más', () => {
+    const text = ['- [ ] T001 — a [P]', '  - files: `/r/a`', '## [ ] T002 — b', '- [ ] **T003. c [P]**', '### T004 — d', '### T005 — [ ] e', '### T006 — [x] f', '- [ ] T010 — g', '  - depends: [T001]'].join('\n')
+    const ticked = tickTasks(text, ['T001', 'T002', 'T003', 'T004', 'T005', 'T006'])
+    expect(ticked).toBe(['- [x] T001 — a [P]', '  - files: `/r/a`', '## [x] T002 — b', '- [x] **T003. c [P]**', '### T004 — [x] d', '### T005 — [x] e', '### T006 — [x] f', '- [ ] T010 — g', '  - depends: [T001]'].join('\n'))
+    expect(parseTasks(ticked).filter((t) => t.done).map((t) => t.id)).toEqual(['T001', 'T002', 'T003', 'T004', 'T005', 'T006'])
+  })
+
+  test('la evidencia de cada hijo se agrega en orden de id y el sobre de la tanda va bajo ## Wave', () => {
+    expect(waveEvidence(2, [{ id: 'T003', text: '| T003 | t | red | green | |\n' }, { id: 'T002', text: '' }])).toBe(
+      '## T002 (parallel wave 2)\n\n_No tdd-evidence/T002.md was written._\n\n## T003 (parallel wave 2)\n\n| T003 | t | red | green | |',
+    )
+    expect(waveEnvelope(2, 3, ['T002', 'T003'], { T002: { ok: true, text: ' hecho ' }, T003: { ok: false, text: '', reason: 'envelope vacío' } })).toBe(
+      '## Wave 2/3: T002, T003\n\n### T002\n\nhecho\n\n### T003 (failed: envelope vacío)\n\n(no envelope)',
+    )
+  })
+})
+
+describe('build en tandas paralelas (hooks)', () => {
+  const DIR = '/w/.sdd/suma-en-paralelo'
+  const TASKS = [
+    ['T001', ''],
+    ['T002', ' [P]'],
+    ['T003', ' [P]'],
+    ['T004', ' [P]'],
+    ['T005', ''],
+  ]
+    .map(([id, p]) => [`- [ ] ${id} — tarea${p}`, `  - files: \`src/${id}.ts\``, `  - depends: [${id === 'T005' ? 'T002, T003, T004' : ''}]`, '  - evidence: `bun test` passes', '  - review: ~50 changed lines'].join('\n'))
+    .join('\n')
+
+  async function world($: any, on: any, agent: (e: any) => Promise<any>) {
+    mock.env(on, { HOME: '/h' })
+    mock.store(on)
+    const clock = mock.clock(on)
+    const files: Record<string, string> = {}
+    const submitted: string[] = []
+    on('fs.read', async (_$: any, e: any) => ({ value: files[e.path] ?? '' }))
+    on('fs.write', async (_$: any, e: any) => {
+      files[e.path] = e.text
+      return { value: undefined }
+    })
+    on('fs.list', async () => ({ value: [] }))
+    on('fs.stat', async () => ({ deny: 'no existe' }))
+    on('process.run', async () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+    on('command.list', async () => ({ value: [] }))
+    on('ui.log', async () => ({ value: undefined }))
+    on('turn.complete', async (_$: any, e: any) => ({ text: e.answer }))
+    on('tool.call', { tool: 'Agent' }, async (_$: any, e: any) => {
+      if (e.subagent_type === 'forge:explore') return done('## Code roots\n- /w\n\nfindings de prueba, suficientemente largos para pasar.')
+      if (e.subagent_type === 'forge:plan') {
+        for (const f of ['proposal.md', 'spec.md', 'design.md']) files[`${DIR}/${f}`] = `# ${f}\n\ncontenido suficiente para validar.\n`
+        files[`${DIR}/tasks.md`] = TASKS
+        return done('plan escrito')
+      }
+      if (e.subagent_type === 'forge:veredicto') return done('todo verde\nVEREDICTO: pasa')
+      return agent(e)
+    })
+    on('session.cwd', async () => ({ value: '/w' }))
+    on('session.id', async () => ({ value: 'sesion' }))
+    on('prompt.submit', async (_$: any, e: any) => {
+      submitted.push(e.text)
+      return { drop: '' }
+    })
+    await $.command.run({ command: 'forge', args: 'phase clarify off' })
+    await $.command.run({ command: 'forge', args: 'phase analyze off' })
+    return { clock, files, submitted }
+  }
+
+  const done = (text: string, agentId = 'a') => ({ result: { status: 'completed', agentId, content: [{ type: 'text', text }], totalToolUseCount: 0, totalDurationMs: 1, totalTokens: 0, usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, server_tool_use: null, service_tier: null, cache_creation: null }, prompt: 'p' } })
+  const call = ($: any) => $.tool.call({ tool: 'Agent', subagent_type: 'forge:build', description: 'forge build', prompt: 'forge suma-en-paralelo build' })
+  const textOf = (r: any) => String(r?.result?.content?.[0]?.text ?? r?.text ?? r?.deny ?? '')
+  const tick = (files: Record<string, string>, ids: string[]) => {
+    files[`${DIR}/tasks.md`] = tickTasks(files[`${DIR}/tasks.md`]!, ids)
+  }
+
+  async function toBuild($: any, w: { files: Record<string, string>; clock: any; submitted: string[] }) {
+    const start: any = await $.command.run({ command: 'forge', args: '--auto suma en paralelo' })
+    expect(start.text.startsWith('run suma-en-paralelo')).toBe(true)
+    await w.clock.advance(30)
+    expect(w.submitted.splice(0).map((t) => t.includes('subagent_type "forge:explore"'))).toEqual([true])
+    await $.tool.call({ tool: 'Agent', subagent_type: 'forge:explore', description: 'forge explore', prompt: 'x' })
+    const plan = textOf(await $.tool.call({ tool: 'Agent', subagent_type: 'forge:plan', description: 'forge plan', prompt: 'x' }))
+    expect(plan).toContain('call the Agent tool with subagent_type "forge:build"')
+    const first = textOf(await call($))
+    expect(first).toContain('build lote 1/3 listo')
+    expect(first).toContain('make 3 Agent tool calls IN ONE SINGLE MESSAGE')
+    expect(w.files['/h/.local/state/forge/state.json'] && JSON.parse(w.files['/h/.local/state/forge/state.json']!).run.batch).toEqual({ index: 2, total: 3, tasks: ['T002', 'T003', 'T004'], parallel: true })
+  }
+
+  test('tres llamadas a la vez toman una tarea cada una, la de más se rechaza y la tanda cierra una sola vez', async ($, on) => {
+    const seen: string[] = []
+    const prompts: Record<string, string> = {}
+    let release!: () => void
+    const gate = new Promise<void>((r) => (release = r))
+    let allIn!: () => void
+    const entered = new Promise<void>((r) => (allIn = r))
+    const w = await world($, on, async (e) => {
+      const wave = /Implement ONLY task (T\d+)/.exec(e.prompt)
+      if (wave) {
+        const id = wave[1]!
+        seen.push(id)
+        prompts[id] = e.prompt
+        if (seen.length === 3) allIn()
+        await gate
+        if (id === 'T003') return done('', `ag-${id}`)
+        w.files[`${DIR}/tdd-evidence/${id}.md`] = `| ${id} | src/${id}.test.ts | red | green | |`
+        return done(`hice ${id}`, `ag-${id}`)
+      }
+      const ids = (/implement ONLY tasks ([T\d, ]+), then return/.exec(e.prompt)?.[1] || '').split(', ').filter(Boolean)
+      tick(w.files, ids)
+      return done(`hice ${ids.join(',')}`)
+    })
+    await toBuild($, w)
+    const calls = [call($), call($), call($), call($)]
+    const extra = textOf(await calls[3])
+    expect(extra).toContain('Extra forge:build call refused')
+    await entered
+    expect([...seen].sort()).toEqual(['T002', 'T003', 'T004'])
+    expect(prompts.T002).toContain('Do NOT edit /w/.sdd/suma-en-paralelo/tasks.md')
+    expect(prompts.T002).toContain('/w/.sdd/suma-en-paralelo/tdd-evidence/T002.md')
+    release()
+    const out = (await Promise.all(calls.slice(0, 3))).map(textOf)
+    const closing = out.filter((t) => t.includes('Next:'))
+    expect(closing.length).toBe(1)
+    expect(out.filter((t) => t.includes('Do not call anything for this result')).length).toBe(2)
+    expect(closing[0]).toContain('build tanda 2/3 (T002, T003, T004) listo · 2/3 entregadas · se reintentan solas: T003')
+    expect(closing[0]).toContain('call the Agent tool with subagent_type "forge:build"')
+    const tasks = parseTasks(w.files[`${DIR}/tasks.md`]!)
+    expect(tasks.filter((t) => t.done).map((t) => t.id)).toEqual(['T001', 'T002', 'T004'])
+    expect(w.files[`${DIR}/tdd-evidence.md`]).toBe('## T002 (parallel wave 2)\n\n| T002 | src/T002.test.ts | red | green | |\n\n## T004 (parallel wave 2)\n\n| T004 | src/T004.test.ts | red | green | |\n')
+    expect(w.files[`${DIR}/build-r1.md`]).toContain('## Batch 1/3: T001\n\nhice T001\n\n## Wave 2/3: T002, T003, T004\n\n### T002\n\nhice T002\n\n### T003 (failed: the build envelope came back empty)\n\n(no envelope)\n\n### T004\n\nhice T004')
+    const retry = textOf(await call($))
+    expect(retry).toContain('build lote 3/4 listo')
+    expect(w.files[`${DIR}/build-r1.md`]).toContain('## Batch 3/4: T003')
+    expect(textOf(await call($))).toContain('Next: call the Agent tool with subagent_type "forge:veredicto"')
+    const end = textOf(await $.tool.call({ tool: 'Agent', subagent_type: 'forge:veredicto', description: 'forge veredicto', prompt: 'x' }))
+    expect(end).toContain('Outcome: PASA (verified) after 1 round(s).')
+    const saved = JSON.parse(w.files[`${DIR}/run.json`]!)
+    expect([saved.status, saved.verdicts, saved.flights, saved.unit]).toEqual(['pasa', ['pasa'], {}, undefined])
+    expect(JSON.parse(w.files[`${DIR}/rounds.json`]!)).toEqual({ cap: 3, verdicts: ['pasa'] })
+  })
+
+  test('en segundo plano y con menos llamadas que las pedidas, la tanda cierra con las que salieron y el resto va en el lote siguiente', async ($, on) => {
+    const w = await world($, on, async (e) => {
+      const wave = /Implement ONLY task (T\d+)/.exec(e.prompt)
+      if (wave) return { result: { status: 'async_launched', agentId: `ag-${wave[1]}`, description: 'd', prompt: e.prompt, outputFile: '/tmp/x' } }
+      const ids = (/implement ONLY tasks ([T\d, ]+), then return/.exec(e.prompt)?.[1] || '').split(', ').filter(Boolean)
+      tick(w.files, ids)
+      return done(`hice ${ids.join(',')}`)
+    })
+    await toBuild($, w)
+    const launched = await Promise.all([call($), call($)])
+    expect(launched.map((r: any) => r.result.status)).toEqual(['async_launched', 'async_launched'])
+    expect(Object.keys(JSON.parse(w.files[`${DIR}/run.json`]!).flights).sort()).toEqual(['ag-T002', 'ag-T003'])
+    await $.turn.complete({ agentId: 'ag-T003', answer: 'hice T003', turnId: 't3', durationMs: 1, isAborted: false } as any)
+    await w.clock.advance(100)
+    expect(w.submitted).toEqual([])
+    await $.turn.complete({ agentId: 'ag-T002', answer: 'hice T002', turnId: 't2', durationMs: 1, isAborted: false } as any)
+    await w.clock.advance(100)
+    expect(w.submitted.length).toBe(1)
+    expect(w.submitted[0]).toContain('2/2 entregadas · sin lanzar, van en la próxima: T004')
+    expect(w.submitted[0]).toContain('Next: call the Agent tool with subagent_type "forge:build"')
+    expect(parseTasks(w.files[`${DIR}/tasks.md`]!).filter((t) => t.done).map((t) => t.id)).toEqual(['T001', 'T002', 'T003'])
+    const saved = JSON.parse(w.files[`${DIR}/run.json`]!)
+    expect([saved.unit.tasks, saved.unit.parallel, saved.flights, saved.verdicts]).toEqual([['T004', 'T005'], false, {}, []])
+    expect(textOf(await call($))).toContain('build lote 3/3 listo')
+  })
+})
+
+describe('tamaño del pedido (hooks)', () => {
+  const done = (text: string) => ({ result: { status: 'completed', agentId: 'a', content: [{ type: 'text', text }], totalToolUseCount: 0, totalDurationMs: 1, totalTokens: 0, usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, server_tool_use: null, service_tier: null, cache_creation: null }, prompt: 'p' } })
+  const textOf = (r: any) => String(r?.result?.content?.[0]?.text ?? r?.text ?? r?.deny ?? '')
+  const agent = ($: any, phase: string) => $.tool.call({ tool: 'Agent', subagent_type: `forge:${phase}`, description: `forge ${phase}`, prompt: 'x' })
+  const CLARIFY = (size: string) => `## Status\ncontinue\n\n## Size\nSize: ${size}\n\n## Assumptions\n- es un typo en el README, nada más`
+
+  async function world($: any, on: any, size: string, picks: string[] = []) {
+    mock.env(on, { HOME: '/h' })
+    mock.store(on)
+    const clock = mock.clock(on)
+    const files: Record<string, string> = {}
+    const logs: string[] = []
+    const asks: string[] = []
+    let dir = ''
+    on('fs.read', async (_$: any, e: any) => ({ value: files[e.path] ?? '' }))
+    on('fs.write', async (_$: any, e: any) => {
+      files[e.path] = e.text
+      return { value: undefined }
+    })
+    on('fs.list', async () => ({ value: [] }))
+    on('fs.stat', async () => ({ deny: 'no existe' }))
+    on('process.run', async () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+    on('command.list', async () => ({ value: [] }))
+    on('ui.log', async (_$: any, e: any) => {
+      logs.push(JSON.stringify(e))
+      return { value: undefined }
+    })
+    on('tool.call', { tool: 'AskUserQuestion' }, async (_$: any, e: any) => {
+      const q = String(e.questions?.[0]?.question ?? '')
+      asks.push(q)
+      return { result: { questions: e.questions, answers: { [q]: picks.shift() ?? 'Continuar' } } }
+    })
+    on('tool.call', { tool: 'Agent' }, async (_$: any, e: any) => {
+      if (e.subagent_type === 'forge:clarify') return done(CLARIFY(size))
+      if (e.subagent_type === 'forge:explore') return done('## Code roots\n- /w\n\nfindings de prueba, suficientemente largos para pasar.')
+      if (e.subagent_type === 'forge:plan') {
+        for (const f of ['proposal.md', 'spec.md', 'design.md']) files[`${dir}/${f}`] = `# ${f}\n\ncontenido suficiente para validar.\n`
+        files[`${dir}/tasks.md`] = '- [ ] T001 — arreglar el typo\n  - files: `README.md`\n  - depends: []\n  - evidence: `bun test` passes\n  - review: ~1 changed lines'
+        return done('plan escrito')
+      }
+      if (e.subagent_type === 'forge:build') {
+        files[`${dir}/tasks.md`] = tickTasks(files[`${dir}/tasks.md`]!, ['T001'])
+        return done('typo arreglado')
+      }
+      return done('todo verde\nVEREDICTO: pasa')
+    })
+    on('session.cwd', async () => ({ value: '/w' }))
+    on('session.id', async () => ({ value: 'sesion' }))
+    on('prompt.submit', async () => ({ drop: '' }))
+    await $.command.run({ command: 'forge', args: 'phase clarify on' })
+    await $.command.run({ command: 'forge', args: 'phase analyze off' })
+    return {
+      files,
+      logs,
+      asks,
+      start: async (args: string) => {
+        const r: any = await $.command.run({ command: 'forge', args })
+        dir = `/w/.sdd/${String(r.text).split(' ')[1]}`
+        await clock.advance(30)
+        return dir
+      },
+    }
+  }
+
+  test('en automatic un pedido chico se anota en routing.log y en el log, el run sigue igual y el cierre recomienda NODD', async ($, on) => {
+    const w = await world($, on, 'small')
+    const dir = await w.start('--auto arreglá un typo del README')
+    const after = textOf(await agent($, 'clarify'))
+    expect(after).toContain('Next: call the Agent tool with subagent_type "forge:explore"')
+    expect(w.files[`${dir}/clarifications.md`]).toContain('Size: small')
+    expect(w.files[`${dir}/routing.log`]).toContain(`tamaño small: ${NODD_HINT}`)
+    expect(w.logs.filter((l) => l.includes('nodd.com.ar')).length).toBe(1)
+    expect(w.asks).toEqual([])
+    expect(JSON.parse(w.files[`${dir}/run.json`]!).size).toBe('small')
+    expect(JSON.parse(w.files['/h/.local/state/forge/state.json']!).run.size).toBe('small')
+    await agent($, 'explore')
+    await agent($, 'plan')
+    expect(textOf(await agent($, 'build'))).toContain('forge:veredicto')
+    const end = textOf(await agent($, 'veredicto'))
+    expect(end).toContain('Outcome: PASA (verified) after 1 round(s).')
+    expect(end).toContain(NODD_HINT)
+    expect(w.logs.filter((l) => l.includes('nodd.com.ar')).length).toBe(1)
+  })
+
+  test('en interactive el aviso va una sola vez en la pausa después de clarify, y un pedido normal no avisa nada', async ($, on) => {
+    const w = await world($, on, 'small', ['Continuar', 'Parar'])
+    const dir = await w.start('--interactive arreglá un typo del README')
+    expect(textOf(await agent($, 'clarify'))).toContain('forge:explore')
+    expect(w.asks.length).toBe(1)
+    expect(w.asks[0]).toContain('¿Seguimos con explore?')
+    expect(w.asks[0]).toContain(NODD_HINT)
+    expect(w.logs.some((l) => l.includes('nodd.com.ar'))).toBe(false)
+    const stopped = textOf(await agent($, 'explore'))
+    expect(w.asks.length).toBe(2)
+    expect(w.asks[1]).not.toContain('nodd.com.ar')
+    expect(stopped).toContain('stopped by the user before plan')
+    expect(stopped).toContain(NODD_HINT)
+    expect(JSON.parse(w.files[`${dir}/run.json`]!).size).toBe('small')
+  })
+
+  test('con Size: normal no hay aviso ni recomendación en el cierre', async ($, on) => {
+    const w = await world($, on, 'normal')
+    const dir = await w.start('--auto agregá un endpoint nuevo')
+    await agent($, 'clarify')
+    expect(w.files[`${dir}/routing.log`]).not.toContain('nodd.com.ar')
+    expect(JSON.parse(w.files[`${dir}/run.json`]!).size).toBe('normal')
+    await agent($, 'explore')
+    await agent($, 'plan')
+    await agent($, 'build')
+    const end = textOf(await agent($, 'veredicto'))
+    expect(end).toContain('Outcome: PASA')
+    expect(end).not.toContain('NODD')
+    expect(w.logs.some((l) => l.includes('nodd.com.ar'))).toBe(false)
   })
 })
 

@@ -25,6 +25,9 @@ Your final reply IS \`clarifications.md\` (forge saves it verbatim). Use exactly
 ## Status
 \`continue\` or \`blocked\`, alone on the line.
 
+## Size
+Exactly one of these lines, alone and verbatim: \`Size: small\` or \`Size: normal\`. Use \`Size: small\` only when the whole request is a one-step change that does not merit a spec: a typo, a rename, a style tweak, a one-line fix or a config adjustment, in one or two files and with no new behavior. When in doubt, \`Size: normal\`. The size never changes the route: the run continues either way.
+
 ## Assumptions
 The concrete defaults the run proceeds under.
 
@@ -68,7 +71,7 @@ Write these four files into the run directory (\`.sdd/<slug>/\`) with the Write 
   - review: ~120 changed lines
 \`\`\`
 
-Rules for tasks: ids are monotonic \`T###\`; every task carries the four bullets \`files\`, \`depends\`, \`evidence\` and \`review\` (forge validates them structurally and re-runs plan when one is missing); \`files\` lists exact paths and marks new files \`(new)\`; \`depends\` points only to earlier task ids (\`[]\` when none); \`evidence\` names a concrete command; for every code task list its test file next to the production file so the build can work test-first; keep each task under ~400 changed lines. End \`tasks.md\` with a \`## Review Workload\` section: a per-task list of the estimates and the **bold total**.
+Rules for tasks: ids are monotonic \`T###\`; every task carries the four bullets \`files\`, \`depends\`, \`evidence\` and \`review\` (forge validates them structurally and re-runs plan when one is missing); \`files\` lists exact paths and marks new files \`(new)\`; \`depends\` points only to earlier task ids (\`[]\` when none); \`evidence\` names a concrete command; for every code task list its test file next to the production file so the build can work test-first; keep each task under ~400 changed lines. Add the token \`[P]\` after the title (\`- [ ] T002 — Add parser [P]\`, never between the id and the dash) only for tasks that are truly parallel-safe: all of its \`depends\` are earlier tasks, and its \`files\` share no path with any other task that could run alongside it. forge runs up to 3 consecutive eligible \`[P]\` tasks with disjoint files at the same time; when in doubt, leave \`[P]\` out. End \`tasks.md\` with a \`## Review Workload\` section: a per-task list of the estimates and the **bold total**.
 
 Keep the plan proportional: a one-function change is one or two tasks, not ten.
 ${SHARED}`,
@@ -80,6 +83,8 @@ Read \`design.md\` (its \`## Code roots\`) and \`tasks.md\` in the run directory
 Implement the tasks in dependency order and stay inside the plan's scope. Unless the brief says \`Strict TDD mode: off\`, when a test runner exists and a task touches code, work **test-first**: RED (write the failing test first and run it), GREEN (minimum code to pass, run the focused test), TRIANGULATE (a second case with different inputs), REFACTOR (keep it green). Record each task in \`tdd-evidence.md\` in the run directory as a table row: task | test file | RED result | GREEN result | notes. Append rows, never erase earlier ones.
 
 After each task passes, mark it \`[x]\` in \`tasks.md\` (Edit). Before finishing, run the full test suite once and make it pass (with a batch, the suite must stay green for the tasks done so far). If the brief carries \`corregir\` feedback from the veredicto, fix exactly those defects first and re-run their tests.
+
+**Parallel wave.** When the brief says you are one task of a parallel wave, other build agents are editing other files at the same time: implement ONLY your task and touch only the paths in its \`files:\`. Do NOT edit \`tasks.md\` or \`tdd-evidence.md\` (they are shared; forge ticks your box and merges your evidence when the wave closes). Write your TDD evidence table to \`tdd-evidence/<T###>.md\` in the run directory instead. Run only your task's focused tests (its \`evidence:\` command), not the full suite: a sibling's half-done edit can turn the suite red for reasons that are not yours.
 
 Your final reply: what you changed (files), the test command you ran and its result (pass/fail counts), and any task you could not complete with the reason.
 ${SHARED}`,
@@ -145,12 +150,13 @@ export function briefFor(p: {
   feedback?: { verdict: Verdict; text: string }
   blockers?: string
   batch?: { index: number; total: number; tasks: string[] }
+  wave?: { index: number; total: number; task: string; tasks: string[] }
   tdd?: 'strict' | 'off'
   adjust?: string
   retryReason?: string
 }): string {
   const lines = [
-    `forge run \`${p.slug}\` · phase **${p.phase}**${p.phase === 'build' || p.phase === 'veredicto' ? ` · round ${p.round}/${p.cap}` : ''}${p.batch ? ` · batch ${p.batch.index + 1}/${p.batch.total}` : ''}`,
+    `forge run \`${p.slug}\` · phase **${p.phase}**${p.phase === 'build' || p.phase === 'veredicto' ? ` · round ${p.round}/${p.cap}` : ''}${p.batch ? ` · batch ${p.batch.index + 1}/${p.batch.total}` : ''}${p.wave ? ` · parallel wave ${p.wave.index + 1}/${p.wave.total} · task ${p.wave.task}` : ''}`,
     '',
     `- Run directory (artifacts): ${p.dir}`,
     `- Code root (working directory): ${p.cwd}`,
@@ -166,6 +172,13 @@ export function briefFor(p: {
   if (p.phase === 'plan') lines.push('', `Read ${p.dir}/findings.md first.`)
   if (p.phase === 'build') lines.push('', `Read ${p.dir}/design.md and ${p.dir}/tasks.md first.`)
   if (p.batch) lines.push('', `Batch ${p.batch.index + 1}/${p.batch.total}: implement ONLY tasks ${p.batch.tasks.join(', ')}, then return. Do not start a task until its depends: entries are [x].`)
+  if (p.wave)
+    lines.push(
+      '',
+      `Parallel wave ${p.wave.index + 1}/${p.wave.total}: you are one of ${p.wave.tasks.length} build agents running at the same time (${p.wave.tasks.join(', ')}). Implement ONLY task ${p.wave.task}, touching only the paths in its files: list. Its depends: entries are already done.`,
+      `Do NOT edit ${p.dir}/tasks.md or ${p.dir}/tdd-evidence.md: forge ticks the box and merges the evidence when the wave closes. Write your TDD evidence table to ${p.dir}/tdd-evidence/${p.wave.task}.md (create the directory if needed).`,
+      `Run only ${p.wave.task}'s focused tests (its evidence: command), not the full suite: the other agents are editing at the same time and can turn it red.`,
+    )
   if (p.tdd && (p.phase === 'build' || p.phase === 'veredicto'))
     lines.push('', p.tdd === 'off' ? 'Strict TDD mode: off (the project opted out in .sdd/config.json).' : 'Strict TDD mode: strict. Follow RED → GREEN → TRIANGULATE → REFACTOR and record the TDD evidence table.')
   if (p.phase === 'veredicto') lines.push('', `The build envelope of this round is ${p.dir}/build-r${p.round}.md.`)
@@ -176,22 +189,37 @@ export function briefFor(p: {
   return lines.join('\n')
 }
 
-export function agentCall(slug: string, phase: Phase): string {
-  return `call the Agent tool with subagent_type "forge:${phase}", description "forge ${phase}", prompt "forge ${slug} ${phase}" and run_in_background false`
+export function agentCall(slug: string, phase: Phase, parallel = 1): string {
+  const one = `subagent_type "forge:${phase}", description "forge ${phase}", prompt "forge ${slug} ${phase}" and run_in_background false`
+  if (parallel < 2) return `call the Agent tool with ${one}`
+  return `make ${parallel} Agent tool calls IN ONE SINGLE MESSAGE so they run in parallel (a parallel wave: forge assigns a different task to each), every one of them with ${one}. Send exactly ${parallel} calls together, not one after the other`
 }
 
-export function startInstruction(slug: string, phase: Phase): string {
+export function startInstruction(slug: string, phase: Phase, parallel = 1): string {
   return [
     `[forge] Run \`${slug}\` is ready. You are only the dispatcher of the forge mod: it decides the phase order, the models and the artifacts.`,
-    `Now ${agentCall(slug, phase)}.`,
+    `Now ${agentCall(slug, phase, parallel)}.`,
     'Every Agent result will tell you the next call. Do not read files, do not do the work yourself, do not comment between calls: just make the next call the result asks for, until a result says the run ended.',
   ].join('\n')
 }
 
-export function nextInstruction(slug: string, phase: Phase, summary: string): string {
-  return `[forge] ${summary}\nNext: ${agentCall(slug, phase)}. No commentary.`
+export function nextInstruction(slug: string, phase: Phase, summary: string, parallel = 1): string {
+  return `[forge] ${summary}\nNext: ${agentCall(slug, phase, parallel)}. No commentary.`
 }
 
-export function finalInstruction(summary: string): string {
-  return `[forge] ${summary}\nThe run ended. Do not call any more agents. Reply to the user in Spanish (rioplatense, voseo) in 2-5 short lines: the outcome, rounds, the artifacts directory and the key reason from the last veredicto. If the outcome is not "pasa", say clearly that the result is NOT verified.`
+export function waveChildInstruction(task: string, wave: { index: number; total: number }, pending: number): string {
+  return `[forge] ${task} of parallel wave ${wave.index + 1}/${wave.total} returned. ${pending} other agent(s) of the wave are still running: the result of the last one carries the next instruction. Do not call anything for this result.`
+}
+
+export function extraCallDenial(phase: Phase, tasks: readonly string[]): string {
+  return phase === 'build' && tasks.length
+    ? `[forge] Extra forge:build call refused: every task of the current build unit (${tasks.join(', ')}) already has its agent. Do not retry it; wait for the results already running.`
+    : `[forge] Extra forge:${phase} call refused: forge:${phase} is already running. Make only the calls a [forge] instruction asks for and wait for their results.`
+}
+
+export const NODD_HINT = 'Esto parece chico para forge: con NODD (https://nodd.com.ar) lo hacés directo y con los tests corridos de verdad.'
+
+export function finalInstruction(summary: string, size?: 'small' | 'normal'): string {
+  const small = size === 'small' ? ` Clarify sized this request as small: include one line recommending NODD for changes of this size, like "${NODD_HINT}"` : ''
+  return `[forge] ${summary}\nThe run ended. Do not call any more agents. Reply to the user in Spanish (rioplatense, voseo) in 2-5 short lines: the outcome, rounds, the artifacts directory and the key reason from the last veredicto. If the outcome is not "pasa", say clearly that the result is NOT verified.${small}`
 }

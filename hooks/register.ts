@@ -31,6 +31,7 @@ import {
   REPLAN_CAP,
   parseDecision,
   parseClarifyStatus,
+  parseSize,
   pickAnswer,
   modelUnavailable,
   DEFAULT_FALLBACK,
@@ -38,13 +39,16 @@ import {
   section,
   parseTasks,
   validateTasks,
-  buildBatches,
+  planUnits,
+  tickTasks,
+  waveEvidence,
+  waveEnvelope,
   builtinModified,
   editZeroProfile,
   profileName,
 } from './logic.ts'
-import type { Phase, Verdict, Mode, RunStatus, Effort, Decision, Outcome } from './logic.ts'
-import { PHASE_PROMPTS, briefFor, startInstruction, nextInstruction, finalInstruction } from './prompts.ts'
+import type { Phase, Verdict, Mode, RunStatus, Effort, Decision, Outcome, WaveResult, Size } from './logic.ts'
+import { PHASE_PROMPTS, briefFor, startInstruction, nextInstruction, finalInstruction, waveChildInstruction, extraCallDenial, NODD_HINT } from './prompts.ts'
 
 const PANE = 'forge'
 const VERSION = '0.4.0'
@@ -142,6 +146,8 @@ const TOOLS: Record<string, { description: string; input_schema: any }> = {
   },
 }
 
+type Unit = { index: number; total: number; tasks: string[]; parallel: boolean; whole: boolean; retry?: boolean; reason?: string; claimed: string[]; results: Record<string, WaveResult> }
+type Flight = { phase: Phase; task?: string; agentId?: string }
 type Stat = { status: 'pending' | 'running' | 'done' | 'error'; model: string; effort?: Effort; answeredBy: string; ms: number; startedAt: number; inTok: number; outTok: number; steps: number }
 type Run = {
   slug: string
@@ -159,9 +165,12 @@ type Run = {
   stats: Record<Phase, Stat>
   decisions: Decision[]
   clarified: boolean
+  size?: Size
   tdd: 'strict' | 'off'
-  batches?: string[][]
-  batchIdx: number
+  unit?: Unit
+  unitIdx: number
+  delivered: string[]
+  retryAlone: { id: string; reason: string }[]
   blockers?: string
   feedback?: { verdict: Verdict; text: string }
   lastVerdictText?: string
@@ -172,7 +181,7 @@ type Run = {
   routing: string[]
   turnId?: string
   awaitTurn: boolean
-  inFlight?: string
+  flights: Record<string, Flight>
   asyncSeen: boolean
   owner?: string
 }
@@ -361,7 +370,8 @@ async function exportState($: any) {
       stats: run.stats,
       verdicts: run.verdicts,
       decisions: run.decisions,
-      batch: run.batches ? { index: run.batchIdx, total: run.batches.length, tasks: run.batches[run.batchIdx] || [] } : undefined,
+      size: run.size,
+      batch: run.unit && !run.unit.whole ? { index: run.unit.index, total: run.unit.total, tasks: [...run.unit.tasks], parallel: run.unit.parallel } : undefined,
     },
   })
   await $.fs.write(`${dir}/state.json`, JSON.stringify(snap, null, 2) + '\n').catch(() => undefined)
@@ -479,9 +489,20 @@ async function restoreRun($: any, agentId?: string) {
     const saved = JSON.parse(String((await $.fs.read(`${dir}/run.json`).catch(() => '')) || ''))
     if (!saved || saved.status !== 'running' || run) return
     const sid = await $.session.id().catch(() => '')
-    if (!(saved.owner && saved.owner === sid) && !(agentId && saved.inFlight === agentId)) return
+    const flights: Record<string, Flight> = {}
+    for (const [k, f] of Object.entries((saved.flights || {}) as Record<string, Flight>)) if (f?.agentId) flights[k] = f
+    if (typeof saved.inFlight === 'string' && saved.inFlight !== 'sync') flights[saved.inFlight] = { phase: saved.expected, agentId: saved.inFlight }
+    if (!(saved.owner && saved.owner === sid) && !(agentId && flights[agentId])) return
     const log = String((await $.fs.read(`${dir}/routing.log`).catch(() => '')) || '')
-    run = { ...saved, routing: [...log.split('\n').filter(Boolean), `${stamp()} forge se recargó a mitad del run; sigue desde ${saved.phase || 'la fase en curso'}`] }
+    const { inFlight: _f, batches: _b, batchIdx: _i, ...keep } = saved
+    run = {
+      ...keep,
+      flights,
+      unitIdx: Number(saved.unitIdx) || 0,
+      delivered: Array.isArray(saved.delivered) ? saved.delivered : [],
+      retryAlone: Array.isArray(saved.retryAlone) ? saved.retryAlone : [],
+      routing: [...log.split('\n').filter(Boolean), `${stamp()} forge se recargó a mitad del run; sigue desde ${saved.phase || 'la fase en curso'}`],
+    } as Run
     await exportState($)
     $.ui.invalidate('ui.render')
   } catch {}
@@ -629,7 +650,10 @@ async function startRun($: any, args: string): Promise<{ error?: string }> {
     decisions: [],
     clarified: false,
     tdd: sddConfig?.tdd?.mode === 'off' ? 'off' : 'strict',
-    batchIdx: 0,
+    unitIdx: 0,
+    delivered: [],
+    retryAlone: [],
+    flights: {},
     startedAt: now(),
     stats,
     retried: false,
@@ -814,8 +838,10 @@ function launch($: any) {
   if (!run || !run.expected) return
   $.clock.after(30, async () => {
     if (!run || !run.expected) return
+    const parallel = await parallelCount($, run.expected)
+    if (!run || !run.expected) return
     run.awaitTurn = true
-    await $.prompt.submit({ text: startInstruction(run.slug, run.expected) }).catch(async (err: any) => {
+    await $.prompt.submit({ text: startInstruction(run.slug, run.expected, parallel) }).catch(async (err: any) => {
       if (!run) return
       run.status = 'fallido'
       run.note = `no pude mandar la instrucción de arranque: ${err}`
@@ -864,10 +890,7 @@ async function callCpam($: any, body: any) {
   return { error: last }
 }
 
-async function finishPhase($: any, phase: Phase, agentId: string | undefined, content: any) {
-  if (!run) return 'forge: sin run'
-  const st = run.stats[phase]
-  st.ms = now() - st.startedAt
+function phaseAnswer(phase: Phase, agentId: string | undefined, content: any): string {
   const fromContent = Array.isArray(content) ? content.filter((b: any) => b.type === 'text').map((b: any) => b.text).join('\n') : ''
   const answer = pickAnswer(phase, String((agentId && (handbacks.get(agentId) || answers.get(agentId))) || fromContent || ''), (agentId && stepTexts.get(agentId)) || [])
   if (agentId) {
@@ -875,9 +898,115 @@ async function finishPhase($: any, phase: Phase, agentId: string | undefined, co
     handbacks.delete(agentId)
     autoAgents.delete(agentId)
   }
-  const cpamFailed = answer.startsWith('FORGE_CPAM_ERROR')
+  return answer
+}
+
+async function readTasks($: any) {
+  return run ? parseTasks(String((await $.fs.read(`${run.dir}/tasks.md`).catch(() => '')) || ''), run.cwd) : []
+}
+
+async function computeUnit($: any): Promise<Unit | undefined> {
+  if (!run) return undefined
+  const tasks = await readTasks($)
+  if (!run) return undefined
+  const skip = new Set([...run.delivered, ...run.retryAlone.map((r) => r.id)])
+  const plan = planUnits(tasks.map((t) => (skip.has(t.id) ? { ...t, done: true } : t)))
+  const base = { index: run.unitIdx, claimed: [] as string[], results: {} as Record<string, WaveResult> }
+  const retry = run.retryAlone[0]
+  if (retry) return { ...base, tasks: [retry.id], parallel: false, whole: false, retry: true, reason: retry.reason, total: run.unitIdx + run.retryAlone.length + plan.length }
+  if (!plan.length) return run.unitIdx === 0 ? { ...base, tasks: [], parallel: false, whole: true, total: 1 } : undefined
+  if (run.unitIdx === 0 && plan.length === 1 && !plan[0]!.parallel) return { ...base, ...plan[0]!, whole: true, total: 1 }
+  return { ...base, ...plan[0]!, whole: false, total: run.unitIdx + plan.length }
+}
+
+function assignUnit(u: Unit | undefined) {
+  if (!run) return
+  run.unit = u
+  if (u?.retry) {
+    run.retryAlone = run.retryAlone.filter((r) => r.id !== u.tasks[0])
+    run.retried = true
+    run.retryReason = `${u.tasks[0]} failed inside a parallel wave (${u.reason || 'no result'}); it is retried alone`
+  }
+}
+
+let unitLoading: Promise<void> | undefined
+
+async function ensureUnit($: any): Promise<Unit | undefined> {
+  if (run && !run.unit) {
+    unitLoading ??= (async () => {
+      const u = await computeUnit($)
+      if (run && !run.unit) assignUnit(u)
+    })().finally(() => {
+      unitLoading = undefined
+    })
+    await unitLoading
+  }
+  return run?.unit
+}
+
+async function parallelCount($: any, phase: Phase | undefined): Promise<number> {
+  if (phase !== 'build') return 1
+  const u = await ensureUnit($)
+  return u?.parallel ? u.tasks.length : 1
+}
+
+const unitFlights = (r: Run, u: Unit) => Object.values(r.flights).filter((f) => f.phase === 'build' && f.task && u.tasks.includes(f.task)).length
+
+function childResult(agentId: string | undefined, content: any, denied?: string): WaveResult {
+  if (denied) return { ok: false, text: '', reason: `refused: ${clip(denied, 200)}` }
+  const answer = phaseAnswer('build', agentId, content)
+  if (answer.startsWith('FORGE_CPAM_ERROR')) return { ok: false, text: clip(answer, 2000), reason: answer.split('\n')[0] }
+  if (!answer.trim()) return { ok: false, text: '', reason: 'the build envelope came back empty' }
+  return { ok: true, text: clip(answer.trim(), 20000) }
+}
+
+async function childDone($: any, key: string, unit: Unit, task: string, res: WaveResult): Promise<{ text: string; closed: boolean }> {
+  if (!run) return { text: 'forge: sin run', closed: false }
+  delete run.flights[key]
+  unit.results[task] = res
+  const pending = unitFlights(run, unit)
+  run.routing.push(`${stamp()} build tanda ${unit.index + 1}/${unit.total} · ${task} ${res.ok ? 'entregó' : `falló (${res.reason})`}${pending ? ` · faltan ${pending}` : ''}`)
+  if (pending || run.unit !== unit) {
+    await persist($)
+    $.ui.invalidate('ui.render')
+    return { text: waveChildInstruction(task, unit, pending), closed: false }
+  }
+  return { text: await closeWave($, unit), closed: true }
+}
+
+async function closeWave($: any, unit: Unit): Promise<string> {
+  if (!run) return 'forge: sin run'
+  const ok = unit.claimed.filter((id) => unit.results[id]?.ok)
+  const failed = unit.claimed.filter((id) => !unit.results[id]?.ok)
+  if (ok.length) {
+    const text = String((await $.fs.read(`${run.dir}/tasks.md`).catch(() => '')) || '')
+    if (text) await $.fs.write(`${run.dir}/tasks.md`, tickTasks(text, ok)).catch(() => undefined)
+    const entries: { id: string; text?: string }[] = []
+    for (const id of ok) entries.push({ id, text: String((await $.fs.read(`${run.dir}/tdd-evidence/${id}.md`).catch(() => '')) || '') })
+    const prev = String((await $.fs.read(`${run.dir}/tdd-evidence.md`).catch(() => '')) || '')
+    await $.fs.write(`${run.dir}/tdd-evidence.md`, `${prev.trim() ? `${prev.trimEnd()}\n\n` : ''}${waveEvidence(unit.index + 1, entries)}\n`).catch(() => undefined)
+  }
+  const left = unit.tasks.filter((id) => !unit.claimed.includes(id))
+  const note = `${ok.length}/${unit.claimed.length} entregadas${failed.length ? ` · se reintentan solas: ${failed.join(', ')}` : ''}${left.length ? ` · sin lanzar, van en la próxima: ${left.join(', ')}` : ''}`
+  return finishPhase($, 'build', undefined, undefined, {
+    body: waveEnvelope(unit.index + 1, unit.total, unit.claimed, unit.results),
+    delivered: ok,
+    failed: failed.map((id) => ({ id, reason: unit.results[id]?.reason || 'no result' })),
+    note,
+  })
+}
+
+type Closed = { body: string; delivered: string[]; failed: { id: string; reason: string }[]; note: string }
+
+async function finishPhase($: any, phase: Phase, agentId: string | undefined, content: any, closed?: Closed) {
+  if (!run) return 'forge: sin run'
+  const st = run.stats[phase]
+  st.ms = now() - st.startedAt
+  const answer = closed ? closed.body : phaseAnswer(phase, agentId, content)
+  const cpamFailed = !closed && answer.startsWith('FORGE_CPAM_ERROR')
   const round = run.verdicts.length + 1
-  const batch = phase === 'build' && run.batches ? { index: run.batchIdx, total: run.batches.length } : undefined
+  const unit = phase === 'build' ? run.unit : undefined
+  const batch = unit && !unit.whole ? { index: unit.index, total: unit.total, parallel: unit.parallel, tasks: unit.tasks } : undefined
   let outcome: Outcome = 'ok'
   let reason = ''
   let asked = false
@@ -892,13 +1021,15 @@ async function finishPhase($: any, phase: Phase, agentId: string | undefined, co
       reason = 'clarifications came back without a "## Status" of continue|blocked'
     } else {
       let text = answer.trim()
+      run.size = parseSize(answer)
+      const small = run.size === 'small' ? `\n\n${NODD_HINT}` : ''
       if (status === 'blocked' && run.mode === 'interactive' && !headless) {
         asked = true
         asking = true
         await exportState($)
         const questions = section(text, 'Blocking questions') || text
         const pick = await $.ui
-          .ask(`forge · clarify necesita una respuesta antes de explorar:\n\n${clip(questions, 1500)}\n\nRespondé en «Other» o seguí con los supuestos.`, { options: ['Seguir con los supuestos', 'Parar'], header: 'forge' })
+          .ask(`forge · clarify necesita una respuesta antes de explorar:\n\n${clip(questions, 1500)}\n\nRespondé en «Other» o seguí con los supuestos.${small}`, { options: ['Seguir con los supuestos', 'Parar'], header: 'forge' })
           .catch(() => 'Parar')
         asking = false
         if (pick === 'Parar') stopNow = true
@@ -908,6 +1039,10 @@ async function finishPhase($: any, phase: Phase, agentId: string | undefined, co
         text += '\n\n## Resolution\nAutomatic mode: nobody could answer the blocking questions, so the run proceeds under the recorded assumptions. Treat them as assumptions, not as confirmed requirements.'
       await $.fs.write(`${run.dir}/clarifications.md`, text + '\n')
       run.clarified = true
+      if (run.size === 'small') {
+        run.routing.push(`${stamp()} tamaño small: ${NODD_HINT}`)
+        if (run.mode !== 'interactive' || headless) $.ui.log(`forge: ${NODD_HINT}`)
+      }
       if (status === 'blocked') run.routing.push(`${stamp()} clarify bloqueado · ${asked ? (stopNow ? 'el usuario paró' : 'respondió el usuario') : 'modo automatic: sigue con supuestos'}`)
     }
   } else if (phase === 'explore') {
@@ -945,9 +1080,9 @@ async function finishPhase($: any, phase: Phase, agentId: string | undefined, co
       outcome = 'fail'
       reason = 'the build envelope came back empty'
     } else {
-      const prev = batch && batch.index > 0 ? String((await $.fs.read(`${run.dir}/build-r${round}.md`).catch(() => '')) || '') : ''
-      const body = batch ? `${prev ? `${prev.trimEnd()}\n\n` : ''}## Batch ${batch.index + 1}/${batch.total}: ${(run.batches?.[batch.index] || []).join(', ')}\n\n${answer.trim()}` : answer.trim()
-      await $.fs.write(`${run.dir}/build-r${round}.md`, body + '\n')
+      const prev = run.unitIdx > 0 ? String((await $.fs.read(`${run.dir}/build-r${round}.md`).catch(() => '')) || '') : ''
+      const own = closed ? closed.body : batch ? `## Batch ${batch.index + 1}/${batch.total}: ${batch.tasks.join(', ')}\n\n${answer.trim()}` : answer.trim()
+      await $.fs.write(`${run.dir}/build-r${round}.md`, `${prev.trim() ? `${prev.trimEnd()}\n\n` : ''}${own}\n`)
     }
   } else {
     await $.fs.write(`${run.dir}/veredicto-r${round}.md`, answer.trim() + '\n')
@@ -965,33 +1100,46 @@ async function finishPhase($: any, phase: Phase, agentId: string | undefined, co
     if (phase === 'plan') run.blockers = undefined
     run.adjust = undefined
   }
-  const nextBatch = phase === 'build' && st.status === 'done' && !!run.batches && run.batchIdx + 1 < run.batches.length
-  const step = nextBatch
+  let nextUnit: Unit | undefined
+  if (phase === 'build' && st.status === 'done') {
+    if (unit) {
+      run.delivered.push(...(closed ? closed.delivered : unit.tasks))
+      if (closed) run.retryAlone.push(...closed.failed)
+      run.unitIdx++
+    }
+    run.unit = undefined
+    nextUnit = await computeUnit($)
+    if (!run) return 'forge: sin run'
+  }
+  const step = nextUnit
     ? { next: 'build' as Phase, status: 'running' as RunStatus }
     : advance(phase, outcome, { rounds: run.verdicts.length, cap: run.cap, retried: run.retried, order: run.order, replans: run.decisions.filter((d) => d === 'replan').length })
-  if (nextBatch) run.batchIdx++
-  else if (phase === 'build' && !step.retry) {
-    run.batches = undefined
-    run.batchIdx = 0
-  }
   run.retried = !!step.retry
   run.retryReason = step.retry ? reason : undefined
+  if (nextUnit) assignUnit(nextUnit)
+  else if (phase === 'build' && step.retry && run.unit) Object.assign(run.unit, { claimed: [], results: {} })
+  else if (phase === 'build') {
+    run.unit = undefined
+    run.unitIdx = 0
+    run.delivered = []
+    run.retryAlone = []
+  }
   run.expected = step.next
   run.status = step.status
   const who = st.answeredBy || st.model
-  const label = batch ? `build lote ${batch.index + 1}/${batch.total}` : phase
-  const head = `${label} ${st.status === 'done' ? 'listo' : 'falló'} · ${who} · ${st.steps} pasos · ${mmss(st.ms)}${phase === 'veredicto' && outcome !== 'fail' && !reason ? ` · veredicto ${outcome} (ronda ${run.verdicts.length}/${run.cap})` : ''}${phase === 'analyze' && outcome !== 'fail' ? ` · decisión ${outcome} (replans ${run.decisions.filter((d) => d === 'replan').length}/${REPLAN_CAP})` : ''}${reason ? ` · ${reason}` : ''}`
+  const label = batch ? `build ${batch.parallel ? 'tanda' : 'lote'} ${batch.index + 1}/${batch.total}${batch.parallel ? ` (${batch.tasks.join(', ')})` : ''}` : phase
+  const head = `${label} ${st.status === 'done' ? 'listo' : 'falló'}${closed ? ` · ${closed.note}` : ''} · ${who} · ${st.steps} pasos · ${mmss(st.ms)}${phase === 'veredicto' && outcome !== 'fail' && !reason ? ` · veredicto ${outcome} (ronda ${run.verdicts.length}/${run.cap})` : ''}${phase === 'analyze' && outcome !== 'fail' ? ` · decisión ${outcome} (replans ${run.decisions.filter((d) => d === 'replan').length}/${REPLAN_CAP})` : ''}${reason ? ` · ${reason}` : ''}`
   run.routing.push(`${stamp()} ${head}`)
   $.ui.log(head)
   if (stopNow && run.status === 'running') {
     run.status = 'parado'
     run.note = 'parado en clarify: había preguntas bloqueantes'
-  } else if (step.next && run.status === 'running' && run.mode === 'interactive' && !headless && !step.retry && !asked && !nextBatch) {
+  } else if (step.next && run.status === 'running' && run.mode === 'interactive' && !headless && !step.retry && !asked && !nextUnit) {
     $.ui.invalidate('ui.render')
     asking = true
     await exportState($)
     const pick = await $.ui
-      .ask(`forge: ${phase} terminó (${clip(who, 30)}). ¿Seguimos con ${step.next}?`, { options: ['Continuar', 'Parar'], header: 'forge' })
+      .ask(`forge: ${phase} terminó (${clip(who, 30)}). ¿Seguimos con ${step.next}?${phase === 'clarify' && run.size === 'small' ? `\n\n${NODD_HINT}` : ''}`, { options: ['Continuar', 'Parar'], header: 'forge' })
       .catch(() => 'Parar')
     asking = false
     if (pick === 'Parar') {
@@ -1003,10 +1151,12 @@ async function finishPhase($: any, phase: Phase, agentId: string | undefined, co
     run.endedAt = now()
     run.expected = run.status === 'parado' ? step.next : undefined
     run.routing.push(`${stamp()} fin: ${STATUS_LABEL[run.status]} · veredictos ${run.verdicts.join(' → ') || '—'} · analyze ${run.decisions.join(' → ') || '—'}`)
-  } else if (!nextBatch) run.stats[step.next as Phase] = { ...blankStat(config.models[step.next as Phase], config.efforts[step.next as Phase]) }
+  } else if (!nextUnit) run.stats[step.next as Phase] = { ...blankStat(config.models[step.next as Phase], config.efforts[step.next as Phase]) }
+  const parallel = run.status === 'running' ? await parallelCount($, step.next) : 1
   await persist($)
   $.ui.invalidate('ui.render')
-  if (run.status === 'running') return nextInstruction(run.slug, step.next as Phase, head)
+  if (run?.status === 'running') return nextInstruction(run.slug, step.next as Phase, head, parallel)
+  if (!run) return 'forge: sin run'
   const outcomeText =
     run.status === 'pasa'
       ? `Outcome: PASA (verified) after ${run.verdicts.length} round(s).`
@@ -1017,7 +1167,7 @@ async function finishPhase($: any, phase: Phase, agentId: string | undefined, co
           : run.status === 'parado'
             ? `Outcome: stopped by the user before ${step.next}. NOT verified. It can be resumed with /forge continue.`
             : `Outcome: FAILED: ${phase} did not deliver twice (${reason}). NOT verified.`
-  return finalInstruction(`${head}\nOutcome phases: ${run.order.join(' → ')}\n${outcomeText}\nArtifacts: ${run.dir}${run.lastVerdictText ? `\nLast veredicto reasoning:\n${clip(run.lastVerdictText, 1500)}` : ''}`)
+  return finalInstruction(`${head}\nOutcome phases: ${run.order.join(' → ')}\n${outcomeText}\nArtifacts: ${run.dir}${run.lastVerdictText ? `\nLast veredicto reasoning:\n${clip(run.lastVerdictText, 1500)}` : ''}`, run.size)
 }
 
 function drawPane($: any, e: any) {
@@ -1066,7 +1216,7 @@ function drawPane($: any, e: any) {
     const color = skipped ? C.muted : state === 'running' ? C.cyan : state === 'done' ? C.lime : state === 'error' ? C.red : C.muted
     const ms = st ? (state === 'running' ? now() - st.startedAt : st.ms) : 0
     const route = routeFor(config.models[p])
-    const batchNote = p === 'build' && run?.batches && state === 'running' ? `lote ${run.batchIdx + 1}/${run.batches.length} ` : ''
+    const batchNote = p === 'build' && run?.unit && !run.unit.whole && state === 'running' ? `${run.unit.parallel ? 'tanda' : 'lote'} ${run.unit.index + 1}/${run.unit.total} ` : ''
     phaseRows.push(
       Box({
         key: `head-${p}`,
@@ -1240,6 +1390,8 @@ export function register(on: any) {
       run.status = 'running'
       run.note = ''
       run.endedAt = undefined
+      run.flights = {}
+      if (run.unit) Object.assign(run.unit, { claimed: [], results: {} })
       run.stats[run.expected] = blankStat(config.models[run.expected], config.efforts[run.expected])
       await persist($)
       await showRun($)
@@ -1302,26 +1454,33 @@ export function register(on: any) {
     if (!phaseOfAgentType(e.subagent_type)) return next(e)
     if (!run || run.status !== 'running' || !run.expected) return { deny: '[forge] There is no running forge run. Do not call forge agents.' }
     const phase = run.expected
+    const unit = phase === 'build' ? await ensureUnit($) : undefined
+    if (!run || run.status !== 'running' || run.expected !== phase) return { deny: '[forge] The forge run moved on while this call was starting. Do not call forge agents until a [forge] instruction asks for it.' }
+    const task = unit?.parallel ? unit.tasks.find((id) => !unit.claimed.includes(id)) : undefined
+    if (unit?.parallel ? !task : Object.keys(run.flights).length > 0 || !!unit?.claimed.length) {
+      run.routing.push(`${stamp()} ${phase}: llamada de más rechazada`)
+      return { deny: extraCallDenial(phase, unit?.tasks || []) }
+    }
+    const fresh = phase !== 'build' || (run.unitIdx === 0 && !unit?.claimed.length)
+    if (unit) unit.claimed.push(...(task ? [task] : unit.tasks.length ? unit.tasks : ['*']))
+    const key = String(e.tool_use_id || `call-${now()}-${Math.random().toString(36).slice(2)}`)
+    run.flights[key] = { phase, ...(task ? { task } : {}) }
     const model = config.models[phase]
     const route = routeFor(model)
     const st = run.stats[phase]
-    if (phase === 'build' && !run.batches) {
-      const batches = buildBatches(parseTasks(String((await $.fs.read(`${run.dir}/tasks.md`).catch(() => '')) || '')))
-      run.batches = batches.length > 1 ? batches : undefined
-      run.batchIdx = 0
-    }
-    const batch = phase === 'build' && run.batches ? { index: run.batchIdx, total: run.batches.length, tasks: run.batches[run.batchIdx] || [] } : undefined
-    if (batch && batch.index > 0 && st.startedAt) Object.assign(st, { status: 'running', model, effort: config.efforts[phase] })
+    if (!fresh && st.startedAt) Object.assign(st, { status: 'running', model, effort: config.efforts[phase] })
     else Object.assign(st, { status: 'running', model, effort: config.efforts[phase], answeredBy: '', startedAt: now(), ms: 0, steps: 0, inTok: 0, outTok: 0 })
+    const batch = unit && !unit.whole && !unit.parallel ? { index: unit.index, total: unit.total, tasks: unit.tasks } : undefined
+    const wave = unit?.parallel && task ? { index: unit.index, total: unit.total, task, tasks: unit.tasks } : undefined
     run.routing.push(
-      `${stamp()} ${phase}${batch ? ` lote ${batch.index + 1}/${batch.total} (${batch.tasks.join(',')})` : ''} arranca · ronda ${roundNow(run)}/${run.cap} · modelo ${model} · effort ${config.efforts[phase]} → ${route.kind === 'cpam' ? 'CPAM' : 'Claude Code'}`,
+      `${stamp()} ${phase}${batch ? ` lote ${batch.index + 1}/${batch.total} (${batch.tasks.join(',')})` : ''}${wave ? ` tanda ${wave.index + 1}/${wave.total} · ${task} (de ${wave.tasks.join(',')})` : ''} arranca · ronda ${roundNow(run)}/${run.cap} · modelo ${model} · effort ${config.efforts[phase]} → ${route.kind === 'cpam' ? 'CPAM' : 'Claude Code'}`,
     )
     await persist($)
     $.ui.invalidate('ui.render')
     const input: any = {
       ...e,
       subagent_type: `forge:${phase}`,
-      description: `forge ${phase}`,
+      description: wave ? `forge build ${task}` : `forge ${phase}`,
       run_in_background: false,
       prompt: briefFor({
         phase,
@@ -1336,6 +1495,7 @@ export function register(on: any) {
         feedback: run.feedback && ((phase === 'build' && run.feedback.verdict === 'corregir') || (phase === 'plan' && run.feedback.verdict === 'replantear')) ? run.feedback : undefined,
         blockers: phase === 'plan' ? run.blockers : undefined,
         batch,
+        wave,
         tdd: run.tdd,
         adjust: run.adjust,
         retryReason: run.retryReason,
@@ -1343,23 +1503,35 @@ export function register(on: any) {
     }
     delete input.model
     if (route.kind === 'claude' && route.alias && AGENT_MODELS.includes(route.alias)) input.model = route.alias
-    run.inFlight = 'sync'
-    const r = await next(input)
+    let r: any
+    try {
+      r = await next(input)
+    } catch (err: any) {
+      r = { deny: String(err?.message || err) }
+    }
     if (!run) return r
-    run.inFlight = undefined
-    if (r.result?.status === 'async_launched' && r.result.agentId) {
-      run.inFlight = r.result.agentId
+    if (r?.result?.status === 'async_launched' && r.result.agentId) {
+      delete run.flights[key]
+      run.flights[r.result.agentId] = { phase, agentId: r.result.agentId, ...(task ? { task } : {}) }
       run.asyncSeen = true
       agentPhase.set(r.result.agentId, phase)
-      run.routing.push(`${stamp()} ${phase} quedó en segundo plano (${r.result.agentId}); forge sigue cuando termine`)
+      run.routing.push(`${stamp()} ${phase}${task ? ` ${task}` : ''} quedó en segundo plano (${r.result.agentId}); forge sigue cuando termine`)
       await persist($)
       return {
         result: r.result,
         context: [
-          `[forge] ${phase} is running in the background. End your turn now with no commentary. When it finishes, ignore the agent's completion notification: forge itself will send you the next [forge] instruction.`,
+          wave
+            ? `[forge] ${task} of the parallel wave is running in the background. When every call of this message is launched, end your turn with no commentary. Ignore the agents' completion notifications: forge itself will send you the next [forge] instruction when the whole wave is done.`
+            : `[forge] ${phase} is running in the background. End your turn now with no commentary. When it finishes, ignore the agent's completion notification: forge itself will send you the next [forge] instruction.`,
         ],
       }
     }
+    if (unit?.parallel && task) {
+      const denied = 'deny' in r && r.deny ? String(r.deny) : undefined
+      const done = await childDone($, key, unit, task, childResult(r?.result?.agentId, r?.result?.content, denied))
+      return denied ? { deny: done.text } : { result: { ...r.result, content: [{ type: 'text', text: done.text }] } }
+    }
+    delete run.flights[key]
     if ('deny' in r && r.deny) {
       run.stats[phase].status = 'error'
       run.status = 'fallido'
@@ -1368,7 +1540,7 @@ export function register(on: any) {
       run.routing.push(`${stamp()} ${run.note}`)
       await persist($)
       $.ui.invalidate('ui.render')
-      return { deny: finalInstruction(`${phase} was refused (${r.deny}). Outcome: FAILED, NOT verified.`) }
+      return { deny: finalInstruction(`${phase} was refused (${r.deny}). Outcome: FAILED, NOT verified.`, run.size) }
     }
     const text = await finishPhase($, phase, r.result?.agentId, r.result?.content)
     return { result: { ...r.result, content: [{ type: 'text', text }] } }
@@ -1482,14 +1654,20 @@ export function register(on: any) {
     if (e.agentId) {
       const phase = await phaseOf($, e.agentId)
       if (phase) answers.set(e.agentId, String(e.answer || ''))
-      if (phase && run && run.status === 'running' && run.inFlight === e.agentId) {
-        run.inFlight = undefined
-        const text = await finishPhase($, phase, e.agentId, [{ type: 'text', text: String(e.answer || '') }])
-        submitLater($, text)
+      const flight = run?.flights[e.agentId]
+      if (phase && run && run.status === 'running' && flight) {
+        if (flight.task && run.unit?.parallel && run.unit.tasks.includes(flight.task)) {
+          const done = await childDone($, e.agentId, run.unit, flight.task, childResult(e.agentId, [{ type: 'text', text: String(e.answer || '') }]))
+          if (done.closed) submitLater($, done.text)
+        } else {
+          delete run.flights[e.agentId]
+          const text = await finishPhase($, phase, e.agentId, [{ type: 'text', text: String(e.answer || '') }])
+          submitLater($, text)
+        }
       }
       return next(e)
     }
-    if (run && run.status === 'running' && !run.inFlight && !run.asyncSeen && run.turnId && e.turnId === run.turnId) {
+    if (run && run.status === 'running' && !Object.keys(run.flights).length && !run.asyncSeen && run.turnId && e.turnId === run.turnId) {
       run.status = 'cortado'
       run.endedAt = now()
       run.note = 'el turno principal terminó antes de cerrar el run · /forge continue'
