@@ -288,6 +288,15 @@ describe('gates y tareas', () => {
     expect(validateTasks('nada')).toEqual(['tasks.md has no T### tasks'])
   })
 
+  test('la evidencia escrita en sub-viñetas cuenta como evidencia', () => {
+    const nested = '### T001 — Suma [P]\n\n- files:\n  - `src/suma.js` (new)\n- depends: []\n- evidence:\n  - `node --test test/suma.test.js` falla antes\n  - `npm test` sigue verde\n- review: ~15 changed lines\n\n### T002 — Vacía\n\n- files:\n  - `src/resta.js` (new)\n- depends: []\n- evidence:\n- review: ~15 changed lines'
+    const [t1] = parseTasks(nested)
+    expect(t1!.evidence).toContain('node --test test/suma.test.js')
+    expect(t1!.evidence).toContain('npm test')
+    expect(t1!.review).toBe(15)
+    expect(validateTasks(nested)).toEqual(['T002 is missing evidence'])
+  })
+
   test('arma los lotes de build con tope de 800 líneas y 4 tareas, saltando las hechas', () => {
     expect(buildBatches(parseTasks(tasks))).toEqual([['T002'], ['T003', 'T004']])
     const many = Array.from({ length: 6 }, (_, i) => ({ id: `T00${i + 1}`, done: false, files: 1, depends: [], evidence: 'x', review: null, reviewRaw: null }))

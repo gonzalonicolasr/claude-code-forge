@@ -271,7 +271,17 @@ export function parseTasks(text: string, root = ''): TaskItem[] {
   const tasks: TaskItem[] = []
   let cur: TaskItem | undefined
   let collecting = false
+  let evidenceIndent: number | null = null
   for (const line of String(text || '').split(/\r?\n/)) {
+    if (evidenceIndent !== null && cur) {
+      const indent = line.match(/^\s*/)![0].length
+      if (line.trim() && indent > evidenceIndent) {
+        const item = line.trim().replace(/^-\s+/, '')
+        cur.evidence = cur.evidence ? `${cur.evidence}; ${item}` : item
+        continue
+      }
+      if (line.trim()) evidenceIndent = null
+    }
     const head = taskHeader(line)
     if (head) {
       cur = { id: head.id, done: head.done, files: 0, depends: null, evidence: '', review: null, reviewRaw: null, paths: [], parallel: /\[P\]/.test(line) }
@@ -294,7 +304,10 @@ export function parseTasks(text: string, root = ''): TaskItem[] {
       cur.files = (value.match(/`[^`]+`/g) || []).length || (value ? 1 : 0)
       cur.paths = filePaths(value, root)
     } else if (field[1] === 'depends') cur.depends = /^(\[\s*\]|none|n\/a|-)?$/i.test(value) ? [] : [...new Set(value.match(/\bT\d+\b/g) || [])]
-    else if (field[1] === 'evidence') cur.evidence = value
+    else if (field[1] === 'evidence') {
+      cur.evidence = value
+      if (!value) evidenceIndent = line.match(/^\s*/)![0].length
+    }
     else {
       cur.reviewRaw = value
       const m = /~?(\d+)\s*(?:changed\s+)?lines?/i.exec(value) || /~?(\d+)/.exec(value)
