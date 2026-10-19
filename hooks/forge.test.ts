@@ -822,8 +822,9 @@ describe('estado exportado', () => {
     const files: Record<string, string> = {}
     on('fs.write', async (_$: any, e: any) => {
       files[e.path] = e.text
+      return { value: undefined }
     })
-    on('process.run', async () => ({ exitCode: 0, stdout: '', stderr: '' }))
+    on('process.run', async () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
     on('command.list', async () => [])
     const r: any = await $.command.run({ command: 'forge', args: 'profile equilibrado' })
     expect(r.text).toBe('perfil equilibrado activo')
@@ -951,7 +952,7 @@ describe('perfiles editables', () => {
       writes.push(e.path)
       return { value: undefined }
     })
-    on('process.run', async () => ({ exitCode: 0, stdout: '', stderr: '' }))
+    on('process.run', async () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
     on('command.list', async () => [])
     on('session.start', async (_$: any, e: any) => ({ cwd: e.cwd }))
     await $.session.start({ cwd: '/tmp', surface: null, isInteractive: false })
@@ -983,8 +984,9 @@ describe('perfiles editables', () => {
     const files: Record<string, string> = {}
     on('fs.write', async (_$: any, e: any) => {
       files[e.path] = e.text
+      return { value: undefined }
     })
-    on('process.run', async () => ({ exitCode: 0, stdout: '', stderr: '' }))
+    on('process.run', async () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
     on('command.list', async () => [])
     await $.command.run({ command: 'forge', args: 'profile turbo' })
     const made: any = await $.command.run({ command: 'forge', args: 'profile new Prueba X' })
