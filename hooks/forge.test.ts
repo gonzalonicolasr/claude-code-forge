@@ -1556,6 +1556,26 @@ describe('handoff desde NODD (hooks)', () => {
     expect([saved.origin, saved.expected, saved.order[0]]).toEqual(['nodd', 'plan', 'explore'])
     expect(JSON.parse(w.files[STATE]!).run.origin).toBe('nodd')
   })
+
+  test('un run en curso sigue con la config con la que arrancó aunque la sesión cambie perfil o modelos', async ($, on) => {
+    const w = await world($, on)
+    const start = await forge($, '--auto agregá un login')
+    expect(start.startsWith('run agrega-un-login')).toBe(true)
+    const dir = '/w/.sdd/agrega-un-login'
+    await forge($, 'profile turbo')
+    await forge($, 'model explore prolite/gpt-6-sol')
+    await forge($, 'effort explore xhigh')
+    await w.clock.advance(30)
+    await agent($, 'clarify')
+    await agent($, 'explore')
+    const saved = JSON.parse(w.files[`${dir}/run.json`]!)
+    expect([saved.profile, saved.models.explore, saved.stats.clarify.model, saved.stats.explore.model, saved.stats.explore.effort, saved.stats.plan.model]).toEqual([
+      'barato', DEFAULT_PROFILES.barato.explore, DEFAULT_PROFILES.barato.clarify, DEFAULT_PROFILES.barato.explore, DEFAULT_EFFORTS.barato.explore, DEFAULT_PROFILES.barato.plan,
+    ])
+    expect(w.files[`${dir}/routing.log`]).toContain(`explore arranca · ronda 0/3 · modelo ${DEFAULT_PROFILES.barato.explore}`)
+    expect(w.files[`${dir}/routing.log`]).not.toContain('modelo prolite/gpt-6-sol')
+    expect(await forge($, 'status')).toContain('perfil turbo')
+  })
 })
 
 describe('un run por sesión (hooks)', () => {
@@ -1568,7 +1588,7 @@ describe('un run por sesión (hooks)', () => {
   })
   const forge = async ($: any, args: string) => String(((await $.command.run({ command: 'forge', args })) as any).text)
 
-  function world(on: any, sid: string, store: Record<string, unknown>) {
+  function world(on: any, sid: string | (() => string), store: Record<string, unknown>) {
     mock.env(on, { HOME: '/h' })
     on('store.get', async (_$: any, e: any) => ({ value: store[e.key] === undefined ? undefined : JSON.parse(JSON.stringify(store[e.key])) }))
     on('store.set', async (_$: any, e: any) => {
@@ -1593,7 +1613,7 @@ describe('un run por sesión (hooks)', () => {
     on('command.list', async () => ({ value: [] }))
     on('ui.log', async () => ({ value: undefined }))
     on('session.cwd', async () => ({ value: '/w' }))
-    on('session.id', async () => ({ value: sid }))
+    on('session.id', async () => ({ value: typeof sid === 'function' ? sid() : sid }))
     on('prompt.submit', async () => ({ drop: '' }))
     return files
   }
@@ -1639,5 +1659,33 @@ describe('un run por sesión (hooks)', () => {
     expect(otherRuns(runs, 'yo', 10 * day)).toEqual([{ slug: 'fps', project: 'ascii-rpg', status: 'running' }])
     expect(staleRunKeys(runs, 10 * day)).toEqual(['run:vieja', 'run:colgada'])
     expect([statePath('/h', 'abc'), statePath('/h', '')]).toEqual(['/h/.local/state/forge/state-abc.json', '/h/.local/state/forge/state.json'])
+  })
+
+  test('cada sesión tiene su config: cambiar el perfil en una no toca la de otra ni el default', async ($, on) => {
+    let sid = 'A'
+    const store: Record<string, unknown> = { config: { mode: 'automatic', cap: 3, profile: 'calidad', models: DEFAULT_PROFILES.calidad, efforts: DEFAULT_EFFORTS.calidad, skip: [] } }
+    world(on, () => sid, store)
+    on('session.start', async (_$: any, e: any) => ({ cwd: e.cwd }))
+    const open = async (id: string) => {
+      sid = id
+      await $.session.start({ cwd: '/w', surface: null, isInteractive: false } as any)
+    }
+    await open('A')
+    expect(await forge($, 'status')).toContain('forge · config default · perfil calidad')
+    await forge($, 'profile turbo')
+    expect([(store['config:A'] as any).profile, (store.config as any).profile]).toEqual(['turbo', 'calidad'])
+    await open('B')
+    expect(await forge($, 'status')).toContain('forge · config default · perfil calidad')
+    await forge($, 'model build prolite/gpt-6-sol')
+    expect([(store['config:A'] as any).profile, (store['config:A'] as any).models.build, (store['config:B'] as any).models.build]).toEqual(['turbo', DEFAULT_PROFILES.turbo.build, 'prolite/gpt-6-sol'])
+    await open('A')
+    expect(await forge($, 'status')).toContain('forge · config de esta sesión · perfil turbo')
+    expect(await forge($, 'config save-default')).toContain('fijada como default (perfil turbo)')
+    expect([store['config:A'], (store.config as any).profile]).toEqual([undefined, 'turbo'])
+    await open('C')
+    expect(await forge($, 'status')).toContain('forge · config default · perfil turbo')
+    await open('B')
+    expect(await forge($, 'config reset')).toBe('esta sesión vuelve a la config default (perfil turbo)')
+    expect(store['config:B']).toBe(undefined)
   })
 })

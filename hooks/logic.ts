@@ -676,6 +676,7 @@ export type RunView = {
 export type StateInput = {
   version: string
   profile: string
+  configScope?: 'default' | 'session'
   profiles: Record<string, Record<Phase, string>>
   profileEfforts: Record<string, Record<Phase, Effort>>
   zeroProfiles?: readonly string[]
@@ -790,6 +791,7 @@ export function stateSnapshot(i: StateInput) {
   return {
     version: i.version,
     profile: i.profile,
+    configScope: i.configScope || 'default',
     profiles,
     phaseOrder: phaseOrder(i.skip),
     phases: [...PHASES],

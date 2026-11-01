@@ -172,6 +172,10 @@ type Run = {
   startedAt: number
   endedAt?: number
   stats: Record<Phase, Stat>
+  // La config con la que arrancó el run: cambiar la de la sesión después no lo toca.
+  models: Record<Phase, string>
+  efforts: Record<Phase, Effort>
+  profile: string
   decisions: Decision[]
   clarified: boolean
   size?: Size
@@ -320,7 +324,9 @@ async function loadConfig($: any) {
   zeroStamp = await zeroMtime($)
   if (!importZero(String((home ? await $.fs.read(`${home}/.pi/zero.json`).catch(() => '') : '') || ''))) zeroImport = { profiles: {}, efforts: {} }
   rebuild(own)
-  const saved: any = await $.store.get('config').catch(() => undefined)
+  void pruneConfigs($)
+  const { saved, scope } = await savedConfig($)
+  configScope = scope
   if (saved && typeof saved === 'object') {
     const base = profiles[saved.profile] || {}
     config = {
@@ -333,9 +339,52 @@ async function loadConfig($: any) {
   }
 }
 
+// Cada sesión tiene su config en config:<sessionId>; una sesión que todavía no cambió nada
+// usa (y sigue) la config global 'config', que es el default de las sesiones nuevas.
+let configScope: 'default' | 'session' = 'default'
+const CONFIG_KEY = 'config:'
+const CONFIG_STALE = 30 * 86400000
+
+async function savedConfig($: any): Promise<{ saved: any; scope: 'default' | 'session' }> {
+  const sid = await mySid($)
+  const own: any = sid ? await $.store.get(CONFIG_KEY + sid).catch(() => undefined) : undefined
+  if (own && typeof own === 'object') {
+    const { at: _at, ...saved } = own
+    return { saved, scope: 'session' }
+  }
+  return { saved: await $.store.get('config').catch(() => undefined), scope: 'default' }
+}
+
 async function saveConfig($: any) {
-  await $.store.set('config', config).catch(() => undefined)
+  const sid = await mySid($)
+  if (sid) {
+    await $.store.set(CONFIG_KEY + sid, { ...config, at: now() }).catch(() => undefined)
+    configScope = 'session'
+  } else await $.store.set('config', config).catch(() => undefined)
   await exportState($)
+}
+
+async function saveDefaultConfig($: any) {
+  await $.store.set('config', config).catch(() => undefined)
+  const sid = await mySid($)
+  if (sid) await $.store.delete(CONFIG_KEY + sid).catch(() => undefined)
+  configScope = 'default'
+  await exportState($)
+}
+
+async function resetSessionConfig($: any) {
+  const sid = await mySid($)
+  if (sid) await $.store.delete(CONFIG_KEY + sid).catch(() => undefined)
+  configScope = 'default'
+  await loadConfig($)
+  await exportState($)
+}
+
+async function pruneConfigs($: any) {
+  for (const k of ((await $.store.keys().catch(() => [])) as string[]).filter((k) => k.startsWith(CONFIG_KEY))) {
+    const v: any = await $.store.get(k).catch(() => undefined)
+    if (!v || typeof v !== 'object' || now() - (Number(v.at) || 0) > CONFIG_STALE) await $.store.delete(k).catch(() => undefined)
+  }
 }
 
 function currentPhase(r: Run): Phase | undefined {
@@ -370,6 +419,7 @@ async function exportState($: any) {
   const snap = stateSnapshot({
     version: VERSION,
     profile: config.profile,
+    configScope,
     profiles,
     profileEfforts,
     zeroProfiles: zeroNames,
@@ -469,8 +519,12 @@ async function syncConfig($: any) {
   try {
     if (await syncProfiles($, gen)) $.ui.invalidate('ui.render')
     if (editing || gen !== editGen) return
-    const saved: any = await $.store.get('config').catch(() => undefined)
+    const { saved, scope } = await savedConfig($)
     if (!saved || typeof saved !== 'object' || editing || gen !== editGen) return
+    if (scope !== configScope) {
+      configScope = scope
+      $.ui.invalidate('ui.render')
+    }
     const next = {
       ...config,
       ...saved,
@@ -563,8 +617,12 @@ async function restoreRun($: any, agentId?: string) {
 async function hydrate($: any, dir: string, saved: any, flights: Record<string, Flight>, line: string): Promise<Run> {
   const log = String((await $.fs.read(`${dir}/routing.log`).catch(() => '')) || '')
   const { inFlight: _f, batches: _b, batchIdx: _i, ...keep } = saved
+  const stats = (saved.stats || {}) as Record<Phase, Stat>
   return {
     ...keep,
+    models: saved.models && typeof saved.models === 'object' ? fillPhases(saved.models) : (Object.fromEntries(PHASES.map((p) => [p, stats[p]?.model || config.models[p]])) as Record<Phase, string>),
+    efforts: saved.efforts && typeof saved.efforts === 'object' ? { ...AUTO_EFFORTS, ...saved.efforts } : (Object.fromEntries(PHASES.map((p) => [p, stats[p]?.effort || config.efforts[p]])) as Record<Phase, Effort>),
+    profile: typeof saved.profile === 'string' ? saved.profile : config.profile,
     flights,
     unitIdx: Number(saved.unitIdx) || 0,
     delivered: Array.isArray(saved.delivered) ? saved.delivered : [],
@@ -798,6 +856,9 @@ async function startRun($: any, args: string | StartArgs, handoff?: Handoff): Pr
     flights: {},
     startedAt: now(),
     stats,
+    models: { ...config.models },
+    efforts: { ...config.efforts },
+    profile: config.profile,
     retried: false,
     note: '',
     routing: handoff?.resumed ? String((await $.fs.read(`${dir}/routing.log`).catch(() => '')) || '').split('\n').filter(Boolean) : [],
@@ -839,7 +900,7 @@ async function continueRun($: any, args: string): Promise<{ text: string; starte
     run.turnId = undefined
     run.awaitTurn = true
     if (run.unit) Object.assign(run.unit, { claimed: [], results: {} })
-    run.stats[run.expected] = blankStat(config.models[run.expected], config.efforts[run.expected])
+    run.stats[run.expected] = blankStat(run.models[run.expected], run.efforts[run.expected])
     await persist($)
     return { text: `sigo ${run.slug} desde ${run.expected}${from}`, started: true }
   }
@@ -879,7 +940,7 @@ async function continueRun($: any, args: string): Promise<{ text: string; starte
 }
 
 async function statusText($: any) {
-  const lines = [`forge · perfil ${config.profile} · modo ${config.mode} · cap ${config.cap} · ${modelsNote}`, `fases: ${phaseOrder(config.skip).join(' → ')}`]
+  const lines = [`forge · config ${configScope === 'session' ? 'de esta sesión' : 'default'} · perfil ${config.profile} · modo ${config.mode} · cap ${config.cap} · ${modelsNote}`, `fases: ${phaseOrder(config.skip).join(' → ')}`]
   for (const err of registerErrors) lines.push(`⚠ no se registró ${err}`)
   for (const p of PHASES)
     lines.push(`  ${p.padEnd(9)} ${config.skip.includes(p) ? '(salteada) ' : ''}${config.models[p]} · effort ${config.efforts[p]}  → ${routeFor(config.models[p]).kind === 'cpam' ? 'CPAM' : 'Claude Code'}`)
@@ -914,6 +975,21 @@ async function commandText($: any, args: string): Promise<string | undefined> {
   const sub = (head || '').toLowerCase()
   if (sub === 'stop' || sub === 'parar') return stopRun($, 'pedido por el usuario')
   if (sub === 'status' || sub === 'estado') return statusText($)
+  if (sub === 'config') {
+    const op = (rest[0] || '').toLowerCase()
+    if (op === 'save-default' || op === 'default' || op === 'fijar') {
+      await saveDefaultConfig($)
+      return `config de esta sesión fijada como default (perfil ${config.profile}): la usan las sesiones nuevas y las que no cambiaron la suya`
+    }
+    if (op === 'reset') {
+      await resetSessionConfig($)
+      return `esta sesión vuelve a la config default (perfil ${config.profile})`
+    }
+    if (op) return 'uso: /forge config [save-default|reset]'
+    return configScope === 'session'
+      ? `config de esta sesión (perfil ${config.profile}); /forge config save-default la fija como default, /forge config reset vuelve al default`
+      : `config default (perfil ${config.profile}); lo que cambies acá queda sólo en esta sesión`
+  }
   if (sub === 'profile' || sub === 'perfil') {
     const op = (rest[0] || '').toLowerCase()
     if (op === 'new' || op === 'nuevo') {
@@ -1371,7 +1447,7 @@ async function finishPhase($: any, phase: Phase, agentId: string | undefined, co
     run.expected = run.status === 'parado' ? step.next : undefined
     if (run.status === 'fallido') run.note = `${phase} no entregó dos veces: ${reason}`
     run.routing.push(`${stamp()} fin: ${STATUS_LABEL[run.status]} · veredictos ${run.verdicts.join(' → ') || '—'} · analyze ${run.decisions.join(' → ') || '—'}`)
-  } else if (!nextUnit) run.stats[step.next as Phase] = { ...blankStat(config.models[step.next as Phase], config.efforts[step.next as Phase]) }
+  } else if (!nextUnit) run.stats[step.next as Phase] = { ...blankStat(run.models[step.next as Phase], run.efforts[step.next as Phase]) }
   const parallel = run.status === 'running' ? await parallelCount($, step.next) : 1
   await persist($)
   $.ui.invalidate('ui.render')
@@ -1498,7 +1574,7 @@ function drawPane($: any, e: any) {
   out.push(card('phases', 'FASES', C.cyan, phaseRows))
   const profileOptions = [...Object.keys(profiles).map((k) => ({ value: k, label: `perfil ${k}${builtinModified(k, profiles[k], profileEfforts[k]) ? ' ★' : ''}` })), ...(config.profile === 'custom' ? [{ value: 'custom', label: 'perfil custom' }] : [])]
   out.push(
-    card('config', 'CONFIG', C.amber, [
+    card('config', `CONFIG ${configScope === 'session' ? '(esta sesión)' : '(default)'}`, C.amber, [
       Select({ key: 'profile', options: profileOptions, value: config.profile, onSelect: (v: string) => void setProfile($, v) }),
       Select({
         key: 'mode',
@@ -1584,7 +1660,7 @@ export function register(on: any) {
         .register({
           name: 'forge',
           description: 'SDD clarify → explore → plan → analyze → build → veredicto, cada fase en su modelo del CPAM',
-          argumentHint: '<pedido> | stop | status | continue [<slug>] | ui | profile [n|new n|save n|delete n|reset n] | model <fase> <id> | effort <fase> <nivel> | phase <clarify|analyze> <on|off> | mode <m> | cap <n>',
+          argumentHint: '<pedido> | stop | status | continue [<slug>] | ui | profile [n|new n|save n|delete n|reset n] | model <fase> <id> | effort <fase> <nivel> | phase <clarify|analyze> <on|off> | mode <m> | cap <n> | config [save-default|reset]',
           immediate: true,
         })
         .catch((err: any) => $.ui.log(`forge: /forge no registrado: ${err}`, { to: 'debug' }))
@@ -1694,15 +1770,15 @@ export function register(on: any) {
     if (unit) unit.claimed.push(...(task ? [task] : unit.tasks.length ? unit.tasks : ['*']))
     const key = String(e.tool_use_id || `call-${now()}-${Math.random().toString(36).slice(2)}`)
     run.flights[key] = { phase, ...(task ? { task } : {}) }
-    const model = config.models[phase]
+    const model = run.models[phase]
     const route = routeFor(model)
     const st = run.stats[phase]
-    if (!fresh && st.startedAt) Object.assign(st, { status: 'running', model, effort: config.efforts[phase] })
-    else Object.assign(st, { status: 'running', model, effort: config.efforts[phase], answeredBy: '', startedAt: now(), ms: 0, steps: 0, inTok: 0, outTok: 0 })
+    if (!fresh && st.startedAt) Object.assign(st, { status: 'running', model, effort: run.efforts[phase] })
+    else Object.assign(st, { status: 'running', model, effort: run.efforts[phase], answeredBy: '', startedAt: now(), ms: 0, steps: 0, inTok: 0, outTok: 0 })
     const batch = unit && !unit.whole && !unit.parallel ? { index: unit.index, total: unit.total, tasks: unit.tasks } : undefined
     const wave = unit?.parallel && task ? { index: unit.index, total: unit.total, task, tasks: unit.tasks } : undefined
     run.routing.push(
-      `${stamp()} ${phase}${batch ? ` lote ${batch.index + 1}/${batch.total} (${batch.tasks.join(',')})` : ''}${wave ? ` tanda ${wave.index + 1}/${wave.total} · ${task} (de ${wave.tasks.join(',')})` : ''} arranca · ronda ${roundNow(run)}/${run.cap} · modelo ${model} · effort ${config.efforts[phase]} → ${route.kind === 'cpam' ? 'CPAM' : 'Claude Code'}`,
+      `${stamp()} ${phase}${batch ? ` lote ${batch.index + 1}/${batch.total} (${batch.tasks.join(',')})` : ''}${wave ? ` tanda ${wave.index + 1}/${wave.total} · ${task} (de ${wave.tasks.join(',')})` : ''} arranca · ronda ${roundNow(run)}/${run.cap} · modelo ${model} · effort ${run.efforts[phase]} → ${route.kind === 'cpam' ? 'CPAM' : 'Claude Code'}`,
     )
     await persist($)
     $.ui.invalidate('ui.render')
@@ -1791,9 +1867,9 @@ export function register(on: any) {
       return { turnId: e.turnId, index: e.index, answer: text, toolUses: [], stopReason: 'end_turn', usage }
     }
     const st = run?.stats[phase]
-    const model = st?.status === 'running' ? st.model : config.models[phase]
+    const model = st?.status === 'running' ? st.model : run?.models?.[phase] || config.models[phase]
     const route = routeFor(model)
-    const effort = route.kind === 'cpam' && effortBlocked(model) ? undefined : st?.status === 'running' ? st.effort : config.efforts[phase]
+    const effort = route.kind === 'cpam' && effortBlocked(model) ? undefined : st?.status === 'running' ? st.effort : run?.efforts?.[phase] || config.efforts[phase]
     if (route.kind === 'claude') {
       const level = claudeEffort(effort)
       const res = yield* next({ ...e, ...(route.model ? { model: route.model } : {}), ...(level ? { effort: level } : {}) })
