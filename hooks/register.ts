@@ -773,6 +773,8 @@ async function continueRun($: any, args: string): Promise<{ text: string; starte
     run.note = ''
     run.endedAt = undefined
     run.flights = {}
+    run.turnId = undefined
+    run.awaitTurn = true
     if (run.unit) Object.assign(run.unit, { claimed: [], results: {} })
     run.stats[run.expected] = blankStat(config.models[run.expected], config.efforts[run.expected])
     await persist($)

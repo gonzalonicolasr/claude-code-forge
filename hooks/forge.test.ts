@@ -799,6 +799,9 @@ describe('continue tras recargar el mod (hooks)', () => {
     expect(w.submitted.length).toBe(1)
     expect(w.submitted[0]).toContain('subagent_type "forge:clarify"')
     expect(JSON.parse(w.files['/w/.sdd/viejo/run.json']!).status).toBe('cortado')
+    await $.turn.start({ turnId: 'otro-turno', text: 'x' } as any)
+    await $.turn.complete({ turnId: 'otro-turno', reason: 'error', answer: 'API Error: 401', durationMs: 1, isAborted: false } as any)
+    expect(JSON.parse(w.files['/w/.sdd/nuevo/run.json']!).note).toBe('el turno principal se cortó por un error de la API (API Error: 401) antes de cerrar el run · /forge continue')
   })
 
   test('con slug retoma ese run de disco, también uno parado; uno terminado no se retoma', async ($, on) => {
