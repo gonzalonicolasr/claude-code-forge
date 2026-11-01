@@ -461,7 +461,7 @@ export function slugify(text: string, taken: readonly string[] = []): string {
   return slug
 }
 
-export type StartArgs = { request: string; mode?: Mode; cap?: number; profile?: string }
+export type StartArgs = { request: string; mode?: Mode; cap?: number; profile?: string; dir?: string }
 
 export function parseStart(args: string): StartArgs {
   const out: StartArgs = { request: '' }
@@ -473,6 +473,7 @@ export function parseStart(args: string): StartArgs {
     else if (t === '--interactive' || t === '--interactivo') out.mode = 'interactive'
     else if (t === '--cap' && /^\d+$/.test(toks[i + 1] || '')) out.cap = Math.max(1, Number(toks[++i]))
     else if (t === '--profile' && toks[i + 1]) out.profile = toks[++i]
+    else if (t === '--dir' && toks[i + 1]) out.dir = toks[++i]
     else rest.push(t)
   }
   out.request = rest.join(' ')
@@ -509,14 +510,14 @@ export function adoptedRunResumable(files: readonly string[], requirements: stri
   )
 }
 
-export type ContinueArgs = { slug: string; mode?: Mode; cap?: number; profile?: string }
+export type ContinueArgs = { slug: string; mode?: Mode; cap?: number; profile?: string; dir?: string }
 
 export function parseContinue(args: string): ContinueArgs | { error: string } | undefined {
   const [head, ...rest] = String(args || '').trim().split(/\s+/)
   const sub = (head || '').toLowerCase()
   if (sub !== 'continue' && sub !== 'seguir') return undefined
   const { request, ...flags } = parseStart(rest.join(' '))
-  if (/\s/.test(request)) return { error: 'uso: /forge continue [--auto|--interactive] [--cap N] [--profile p] [<slug>]' }
+  if (/\s/.test(request)) return { error: 'uso: /forge continue [--auto|--interactive] [--cap N] [--profile p] [--dir <ruta>] [<slug>]' }
   if (request && (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(request) || request.includes('..'))) return { error: `slug inválido: ${request}` }
   return { slug: request, ...flags }
 }

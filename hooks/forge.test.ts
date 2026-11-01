@@ -828,6 +828,81 @@ describe('continue tras recargar el mod (hooks)', () => {
   })
 })
 
+describe('directorio del run (hooks)', () => {
+  const forge = async ($: any, args: string) => String(((await $.command.run({ command: 'forge', args })) as any).text)
+
+  async function world($: any, on: any, cwd: string, git: Record<string, { exitCode: number; stdout: string }> = {}, dirs: string[] = []) {
+    mock.env(on, { HOME: '/h' })
+    mock.store(on)
+    const clock = mock.clock(on)
+    const files: Record<string, string> = {}
+    on('fs.read', async (_$: any, e: any) => ({ value: files[e.path] ?? '' }))
+    on('fs.write', async (_$: any, e: any) => {
+      files[e.path] = e.text
+      return { value: undefined }
+    })
+    on('fs.list', async () => ({ value: [] }))
+    on('fs.stat', async (_$: any, e: any) => (dirs.includes(e.path) ? { value: { kind: 'dir', size: 0, mtimeMs: 1 } } : { deny: 'no existe' }))
+    on('process.run', async (_$: any, e: any) => {
+      const argv = e.argv || e.command || []
+      const at = argv[0] === 'git' ? git[argv[2]] : undefined
+      return { value: { exitCode: at ? at.exitCode : 0, stdout: at ? at.stdout : '', stderr: '' } }
+    })
+    on('command.list', async () => ({ value: [] }))
+    on('ui.log', async () => ({ value: undefined }))
+    on('session.cwd', async () => ({ value: cwd }))
+    on('session.id', async () => ({ value: 'sesion' }))
+    on('prompt.submit', async () => ({ drop: '' }))
+    return { clock, files }
+  }
+
+  test('arrancar en $HOME o fuera de un repo git avisa en el mensaje y en routing.log, y el run sigue igual', async ($, on) => {
+    const w = await world($, on, '/h')
+    const text = await forge($, '--auto busca mejoras de performance')
+    expect(text).toContain('artefactos: /h/.sdd/busca-mejoras-de-performance')
+    expect(text).toContain('⚠ el run usa /h, que es tu $HOME y no un proyecto: si el proyecto es otro, /forge stop y /forge --dir <ruta del repo> <pedido>')
+    expect(w.files['/h/.sdd/busca-mejoras-de-performance/routing.log']).toContain('que es tu $HOME')
+    expect(JSON.parse(w.files['/h/.sdd/busca-mejoras-de-performance/run.json']!).status).toBe('running')
+  })
+
+  test('fuera de un repo git avisa en cada run; con --dir no avisa', async ($, on) => {
+    const w = await world($, on, '/tmp/suelto', { '/tmp/suelto': { exitCode: 128, stdout: '' } }, ['/w/wt'])
+    expect(await forge($, '--auto uno')).toContain('⚠ el run usa /tmp/suelto, que no está dentro de un repo git')
+    await forge($, 'stop')
+    expect(await forge($, '--auto dos')).toContain('⚠ el run usa /tmp/suelto')
+    await forge($, 'stop')
+    const explicit = await forge($, '--auto --dir /w/wt tres')
+    expect(explicit).toContain('artefactos: /w/wt/.sdd/tres')
+    expect(explicit).not.toContain('⚠')
+    expect(JSON.parse(w.files['/w/wt/.sdd/tres/run.json']!).cwd).toBe('/w/wt')
+  })
+
+  test('--dir apunta el run a otro proyecto; una ruta relativa o que no existe se rechaza', async ($, on) => {
+    const w = await world($, on, '/h', {}, ['/h/projects/ascii-rpg'])
+    expect(await forge($, '--auto --dir projects/x algo')).toBe('--dir necesita una ruta absoluta (o con ~): projects/x')
+    expect(await forge($, '--auto --dir /no/esta algo')).toBe('--dir /no/esta: no existe o no es un directorio')
+    const text = await forge($, '--auto --dir ~/projects/ascii-rpg/ busca fps')
+    expect(text).toBe('run busca-fps · modo automatic · cap 3 · perfil barato\nartefactos: /h/projects/ascii-rpg/.sdd/busca-fps')
+    const saved = JSON.parse(w.files['/h/projects/ascii-rpg/.sdd/busca-fps/run.json']!)
+    expect([saved.cwd, saved.dir, saved.request]).toEqual(['/h/projects/ascii-rpg', '/h/projects/ascii-rpg/.sdd/busca-fps', 'busca fps'])
+    expect(w.files['/h/.sdd/busca-fps/run.json']).toBe(undefined)
+  })
+
+  test('continue --dir busca el run cortado en ese proyecto', async ($, on) => {
+    const w = await world($, on, '/h', {}, ['/h/projects/ascii-rpg'])
+    const dir = '/h/projects/ascii-rpg/.sdd/fps'
+    const stat = { status: 'pending', model: 'm', effort: 'auto', answeredBy: '', ms: 0, startedAt: 0, inTok: 0, outTok: 0, steps: 0 }
+    w.files[`${dir}/run.json`] = JSON.stringify({ slug: 'fps', dir, cwd: '/h/projects/ascii-rpg', request: 'fps', mode: 'automatic', cap: 3, verdicts: [], expected: 'explore', status: 'cortado', order: [...PHASES], decisions: [], clarified: true, tdd: 'strict', unitIdx: 0, delivered: [], retryAlone: [], flights: {}, startedAt: 1, endedAt: 2, stats: Object.fromEntries(PHASES.map((p) => [p, stat])), retried: false, note: 'x', awaitTurn: false, asyncSeen: false })
+    expect(await forge($, 'continue fps')).toContain('no adopto .sdd/fps')
+    expect(await forge($, 'continue --dir ~/projects/ascii-rpg fps')).toBe(`sigo fps desde explore (recuperado de ${dir}/run.json)`)
+  })
+
+  test('el worktree avisa con el repo principal', async ($, on) => {
+    await world($, on, '/w/wt', { '/w/wt': { exitCode: 0, stdout: '/w/wt\n/w/main/.git/worktrees/wt\n/w/main/.git\n' } })
+    expect(await forge($, '--auto cuatro')).toContain('⚠ el run usa /w/wt, un worktree de git (/w/wt) y no el repo principal /w/main: si querías el principal, /forge stop y /forge --dir /w/main <pedido>')
+  })
+})
+
 describe('arranque', () => {
   test('slug corto, sin tildes y sin pisar runs existentes', () => {
     expect(slugify('Agregá una función suma(a, b)')).toBe('agrega-una-funcion-suma-a-b')
@@ -839,6 +914,7 @@ describe('arranque', () => {
   test('las banderas se separan del pedido', () => {
     expect(parseStart('--auto --cap 2 agregá suma')).toEqual({ request: 'agregá suma', mode: 'automatic', cap: 2 })
     expect(parseStart('--interactive --profile calidad hacé X')).toEqual({ request: 'hacé X', mode: 'interactive', profile: 'calidad' })
+    expect(parseStart('--auto --dir /w/repo hacé X')).toEqual({ request: 'hacé X', mode: 'automatic', dir: '/w/repo' })
   })
 })
 
@@ -1241,7 +1317,8 @@ describe('handoff desde NODD', () => {
     expect(parseContinue('seguir login-magic-link')).toEqual({ slug: 'login-magic-link' })
     expect(parseContinue('continue --auto --cap 2 login-magic-link')).toEqual({ slug: 'login-magic-link', mode: 'automatic', cap: 2 })
     expect(parseContinue('Continue --interactive')).toEqual({ slug: '', mode: 'interactive' })
-    expect(parseContinue('continue a b')).toEqual({ error: 'uso: /forge continue [--auto|--interactive] [--cap N] [--profile p] [<slug>]' })
+    expect(parseContinue('continue a b')).toEqual({ error: 'uso: /forge continue [--auto|--interactive] [--cap N] [--profile p] [--dir <ruta>] [<slug>]' })
+    expect(parseContinue('continue --dir ~/projects/ascii-rpg corte')).toEqual({ slug: 'corte', dir: '~/projects/ascii-rpg' })
     expect(parseContinue('continue ../etc')).toEqual({ error: 'slug inválido: ../etc' })
     expect(parseContinue('continuar con el login')).toBe(undefined)
     expect(parseContinue('status')).toBe(undefined)

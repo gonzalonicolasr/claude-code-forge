@@ -655,13 +655,38 @@ async function openPane($: any) {
   return r
 }
 
-type Handoff = { slug: string; dir: string; cwd: string; request: string; resumed?: boolean }
+type Handoff = { slug: string; dir: string; cwd: string; request: string; resumed?: boolean; explicit?: boolean }
 
-async function startRun($: any, args: string | StartArgs, handoff?: Handoff): Promise<{ error?: string }> {
+async function pickDir($: any, raw: string): Promise<{ dir: string } | { error: string }> {
+  if (!home) home = (await $.env.get('HOME').catch(() => '')) || ''
+  const path = (raw === '~' || raw.startsWith('~/') ? `${home}${raw.slice(1)}` : raw).replace(/\/+$/, '') || '/'
+  if (!path.startsWith('/')) return { error: `--dir necesita una ruta absoluta (o con ~): ${raw}` }
+  const st: any = await $.fs.stat(path).catch(() => undefined)
+  if (st?.kind !== 'dir') return { error: `--dir ${raw}: no existe o no es un directorio` }
+  return { dir: path }
+}
+
+async function projectWarning($: any, cwd: string): Promise<string> {
+  if (!home) home = (await $.env.get('HOME').catch(() => '')) || ''
+  const fix = 'si el proyecto es otro, /forge stop y /forge --dir <ruta del repo> <pedido>'
+  if (home && cwd.replace(/\/+$/, '') === home.replace(/\/+$/, '')) return `⚠ el run usa ${cwd}, que es tu $HOME y no un proyecto: ${fix}`
+  const git = await $.process.run(['git', '-C', cwd, 'rev-parse', '--path-format=absolute', '--show-toplevel', '--git-dir', '--git-common-dir']).catch(() => ({ exitCode: 1, stdout: '' }))
+  if (git.exitCode !== 0) return `⚠ el run usa ${cwd}, que no está dentro de un repo git: ${fix}`
+  const [top, gitDir, common] = String(git.stdout || '').trim().split('\n')
+  if (top && gitDir && common && gitDir !== common) {
+    const main = common.replace(/\/\.git\/?$/, '')
+    return `⚠ el run usa ${cwd}, un worktree de git (${top}) y no el repo principal ${main}: si querías el principal, /forge stop y /forge --dir ${main} <pedido>`
+  }
+  return ''
+}
+
+async function startRun($: any, args: string | StartArgs, handoff?: Handoff): Promise<{ error?: string; warning?: string }> {
   if (run && run.status === 'running') return { error: `ya hay un run corriendo (${run.slug}). /forge stop para cortarlo.` }
   const flags = typeof args === 'string' ? parseStart(args) : args
   const parsed = handoff ? { ...flags, request: handoff.request } : flags
-  if (!parsed.request) return { error: 'falta el pedido: /forge [--auto|--interactive] [--cap N] [--profile barato|calidad] <pedido>' }
+  if (!parsed.request) return { error: 'falta el pedido: /forge [--auto|--interactive] [--cap N] [--profile barato|calidad] [--dir <ruta>] <pedido>' }
+  const chosen = !handoff && parsed.dir ? await pickDir($, parsed.dir) : undefined
+  if (chosen && 'error' in chosen) return { error: chosen.error }
   if (parsed.profile && !(await setProfile($, parsed.profile))) return { error: `no existe el perfil "${parsed.profile}" (hay: ${Object.keys(profiles).join(', ')})` }
   let mode: Mode = parsed.mode || (config.mode === 'preguntar' ? 'automatic' : config.mode)
   if (!parsed.mode && config.mode === 'preguntar' && !headless) {
@@ -675,7 +700,7 @@ async function startRun($: any, args: string | StartArgs, handoff?: Handoff): Pr
     dir = handoff.dir
     await $.fs.write(`${dir}/request.md`, handoff.request)
   } else {
-    cwd = await $.session.cwd()
+    cwd = chosen ? chosen.dir : await $.session.cwd()
     const taken = ((await $.fs.list(`${cwd}/.sdd`).catch(() => [])) as any[]).map((f: any) => f.name)
     slug = slugify(parsed.request, taken)
     dir = `${cwd}/.sdd/${slug}`
@@ -717,9 +742,11 @@ async function startRun($: any, args: string | StartArgs, handoff?: Handoff): Pr
     asyncSeen: false,
     ...(handoff ? { origin: 'nodd' as const } : {}),
   }
+  const warning = chosen || handoff?.explicit ? '' : await projectWarning($, cwd)
   run.routing.push(`${stamp()} run ${slug}${handoff ? ` · ${handoff.resumed ? 'retomado desde explore: era un run adoptado de NODD cortado antes de spec.md' : 'adoptado de NODD'} (requirements.md de /nodd-promote, sin clarify)` : ''} · modo ${mode} · cap ${run.cap} · perfil ${config.profile} · tdd ${run.tdd} · fases ${order.join(' → ')} · ${order.map((p) => `${p}=${config.models[p]}`).join(' ')}`)
+  if (warning) run.routing.push(`${stamp()} ${warning}`)
   await persist($)
-  return {}
+  return warning ? { warning } : {}
 }
 
 async function readHandoff($: any, cwd: string, slug: string): Promise<Handoff | { why: string }> {
@@ -753,7 +780,9 @@ async function continueRun($: any, args: string): Promise<{ text: string; starte
   }
   if (run && run.expected && (run.status === 'parado' || run.status === 'cortado') && (!parsed.slug || parsed.slug === run.slug)) return resume()
   if (run && run.status === 'running') return { text: `ya hay un run corriendo (${run.slug}). /forge stop para cortarlo.`, started: false }
-  const cwd = await $.session.cwd().catch(() => '')
+  const picked = parsed.dir ? await pickDir($, parsed.dir) : undefined
+  if (picked && 'error' in picked) return { text: picked.error, started: false }
+  const cwd = picked ? picked.dir : await $.session.cwd().catch(() => '')
   const stopped = await findStopped($, cwd, parsed.slug)
   if (stopped) {
     run = await hydrate($, stopped.dir, stopped.saved, {}, `retomado de run.json con /forge continue (estaba ${STATUS_LABEL[stopped.saved.status as RunStatus]}${stopped.saved.note ? `: ${stopped.saved.note}` : ''})`)
@@ -776,11 +805,12 @@ async function continueRun($: any, args: string): Promise<{ text: string; starte
     if (found.length > 1) return { text: `hay ${found.length} handoffs de NODD en .sdd/: ${found.map((h) => h.slug).join(', ')}. Elegí uno con /forge continue <slug>.`, started: false }
     handoff = found[0]
   }
-  const res = await startRun($, { request: '', mode: parsed.mode, cap: parsed.cap, profile: parsed.profile }, handoff)
+  const res = await startRun($, { request: '', mode: parsed.mode, cap: parsed.cap, profile: parsed.profile }, { ...handoff!, explicit: !!picked })
   if (res.error || !run) return { text: res.error || 'forge: no pude adoptar el handoff', started: false }
+  const warn = res.warning ? `\n${res.warning}` : ''
   if (handoff!.resumed)
-    return { text: `retomo el run adoptado de NODD ${run.slug}: plan no llegó a escribir spec.md, así que vuelve a ${run.expected} sin clarify · modo ${run.mode} · cap ${run.cap} · perfil ${config.profile}\nartefactos: ${run.dir}`, started: true }
-  return { text: `adopto el handoff de NODD ${run.slug}: arranca en ${run.expected} sin clarify · modo ${run.mode} · cap ${run.cap} · perfil ${config.profile}\nartefactos: ${run.dir}`, started: true }
+    return { text: `retomo el run adoptado de NODD ${run.slug}: plan no llegó a escribir spec.md, así que vuelve a ${run.expected} sin clarify · modo ${run.mode} · cap ${run.cap} · perfil ${config.profile}\nartefactos: ${run.dir}${warn}`, started: true }
+  return { text: `adopto el handoff de NODD ${run.slug}: arranca en ${run.expected} sin clarify · modo ${run.mode} · cap ${run.cap} · perfil ${config.profile}\nartefactos: ${run.dir}${warn}`, started: true }
 }
 
 async function statusText($: any) {
@@ -1455,6 +1485,7 @@ async function startFromPane($: any, text: string) {
     $.ui.toast(`forge: ${res.error}`)
     return
   }
+  if (res.warning) $.ui.toast(`forge: ${res.warning}`)
   draft = ''
   launch($)
   $.ui.invalidate('ui.render')
@@ -1525,7 +1556,7 @@ export function register(on: any) {
     if (res.error) return { text: `${res.error}` }
     await showRun($)
     launch($)
-    return { text: `run ${run?.slug} · modo ${run?.mode} · cap ${run?.cap} · perfil ${config.profile}\nartefactos: ${run?.dir}` }
+    return { text: `run ${run?.slug} · modo ${run?.mode} · cap ${run?.cap} · perfil ${config.profile}\nartefactos: ${run?.dir}${res.warning ? `\n${res.warning}` : ''}` }
   })
 
   on('prompt.submit', async ($: any, e: any, next: any) => {
@@ -1541,6 +1572,7 @@ export function register(on: any) {
     if (text !== undefined) return { drop: text.replace(/\n\s*/g, ' | ') }
     const res = await startRun($, args)
     if (res.error || !run) return { drop: `forge: ${res.error}` }
+    if (res.warning) $.ui.log(`forge: ${res.warning}`)
     return next({ ...e, text: startInstruction(run.slug, run.expected || 'explore') })
   })
 
