@@ -49,7 +49,13 @@ import {
   builtinModified,
   editZeroProfile,
   profileName,
+  statePath,
+  otherRuns,
+  staleRunKeys,
+  isRunEntry,
+  RUN_KEY,
 } from './logic.ts'
+import type { OtherRun } from './logic.ts'
 import type { Phase, Verdict, Mode, RunStatus, Effort, Decision, Outcome, WaveResult, Size, StartArgs } from './logic.ts'
 import { PHASE_PROMPTS, briefFor, startInstruction, nextInstruction, finalInstruction, waveChildInstruction, extraCallDenial, NODD_HINT } from './prompts.ts'
 
@@ -336,11 +342,26 @@ function currentPhase(r: Run): Phase | undefined {
   return r.order.find((p) => r.stats[p].status === 'running') || r.expected
 }
 
+let others: OtherRun[] = []
+let othersAt = -Infinity
+
+async function storeRuns($: any): Promise<Record<string, unknown>> {
+  const keys = ((await $.store.keys().catch(() => [])) as string[]).filter((k) => k.startsWith(RUN_KEY))
+  const out: Record<string, unknown> = {}
+  for (const k of keys) out[k] = await $.store.get(k).catch(() => undefined)
+  return out
+}
+
 async function exportState($: any) {
   if (headless) return
   if (!home) home = (await $.env.get('HOME').catch(() => '')) || ''
   if (!home) return
   if (!editing) await syncConfig($)
+  const sid = await mySid($)
+  if (now() - othersAt > 10000) {
+    othersAt = now()
+    others = otherRuns(await storeRuns($), sid, now())
+  }
   const dir = `${home}/.local/state/forge`
   if (!stateDirReady) {
     const made = await $.process.run(['mkdir', '-p', dir]).catch(() => ({ exitCode: 1 }))
@@ -361,6 +382,7 @@ async function exportState($: any) {
     modelIds,
     asking,
     now: now(),
+    others,
     run: run && {
       status: run.status,
       request: run.request,
@@ -379,7 +401,7 @@ async function exportState($: any) {
       batch: run.unit && !run.unit.whole ? { index: run.unit.index, total: run.unit.total, tasks: [...run.unit.tasks], parallel: run.unit.parallel } : undefined,
     },
   })
-  await $.fs.write(`${dir}/state.json`, JSON.stringify(snap, null, 2) + '\n').catch(() => undefined)
+  await $.fs.write(statePath(home, sid), JSON.stringify(snap, null, 2) + '\n').catch(() => undefined)
 }
 
 async function nervLoaded($: any) {
@@ -484,24 +506,58 @@ async function checkInbox($: any) {
   }
 }
 
-async function restoreRun($: any, agentId?: string) {
-  if (run || (!agentId && now() - restoreTriedAt < 30000)) return
-  if (!agentId) restoreTriedAt = now()
-  let dir = await $.store.get('activeRun').catch(() => undefined)
-  if (typeof dir !== 'string' || !dir) dir = await recentRunDir($)
-  if (typeof dir !== 'string' || !dir) return
+async function mySid($: any): Promise<string> {
+  return (await $.session.id().catch(() => '')) || sessionId
+}
+
+// Antes había un solo activeRun para todas las sesiones: se pasa a run:<dueño> con el owner de su run.json.
+let legacyChecked = false
+async function migrateLegacy($: any) {
+  if (legacyChecked) return
+  legacyChecked = true
+  const dir = await $.store.get('activeRun').catch(() => undefined)
+  if (dir === undefined) return
+  try {
+    const saved = typeof dir === 'string' && dir ? JSON.parse(String((await $.fs.read(`${dir}/run.json`).catch(() => '')) || '')) : undefined
+    if (saved?.owner && !isRunEntry(await $.store.get(RUN_KEY + saved.owner).catch(() => undefined)))
+      await $.store.set(RUN_KEY + saved.owner, { dir, slug: String(saved.slug || ''), cwd: String(saved.cwd || ''), status: String(saved.status || ''), at: now() })
+  } catch {}
+  await $.store.delete('activeRun').catch(() => undefined)
+}
+
+async function tryHydrate($: any, dir: string, sid: string, agentId?: string): Promise<boolean> {
   try {
     const saved = JSON.parse(String((await $.fs.read(`${dir}/run.json`).catch(() => '')) || ''))
-    if (!saved || saved.status !== 'running' || run) return
-    const sid = await $.session.id().catch(() => '')
+    if (!saved || saved.status !== 'running' || run) return false
     const flights: Record<string, Flight> = {}
     for (const [k, f] of Object.entries((saved.flights || {}) as Record<string, Flight>)) if (f?.agentId) flights[k] = f
     if (typeof saved.inFlight === 'string' && saved.inFlight !== 'sync') flights[saved.inFlight] = { phase: saved.expected, agentId: saved.inFlight }
-    if (!(saved.owner && saved.owner === sid) && !(agentId && flights[agentId])) return
+    if (!(saved.owner && saved.owner === sid) && !(agentId && flights[agentId])) return false
     run = await hydrate($, dir, saved, flights, `forge se recargó a mitad del run; sigue desde ${saved.phase || 'la fase en curso'}`)
+    return true
+  } catch {
+    return false
+  }
+}
+
+// Cada sesión retoma sólo su run (run:<sessionId>); el de otra sesión, sólo si llega un hijo suyo por agentId.
+async function restoreRun($: any, agentId?: string) {
+  if (run || (!agentId && now() - restoreTriedAt < 30000)) return
+  if (!agentId) restoreTriedAt = now()
+  const sid = await mySid($)
+  await migrateLegacy($)
+  const dirs: string[] = []
+  const mine = sid ? await $.store.get(RUN_KEY + sid).catch(() => undefined) : undefined
+  if (isRunEntry(mine)) dirs.push(mine.dir)
+  const recent = await recentRunDir($)
+  if (recent && !dirs.includes(recent)) dirs.push(recent)
+  if (agentId) for (const e of Object.values(await storeRuns($))) if (isRunEntry(e) && e.status === 'running' && !dirs.includes(e.dir)) dirs.push(e.dir)
+  for (const dir of dirs) {
+    if (run) break
+    if (!(await tryHydrate($, dir, sid, agentId))) continue
     await exportState($)
     $.ui.invalidate('ui.render')
-  } catch {}
+  }
 }
 
 async function hydrate($: any, dir: string, saved: any, flights: Record<string, Flight>, line: string): Promise<Run> {
@@ -553,9 +609,16 @@ async function findStopped($: any, base: string, slug: string): Promise<{ dir: s
 async function persist($: any) {
   await exportState($)
   if (!run) return
-  if (!run.owner) run.owner = await $.session.id().catch(() => undefined)
-  await $.store.set('activeRun', run.status === 'running' ? run.dir : null).catch(() => undefined)
-  await $.store.set('lastRun', run.dir).catch(() => undefined)
+  if (!run.owner) run.owner = (await mySid($)) || undefined
+  if (run.owner) {
+    const prev: any = await $.store.get(RUN_KEY + run.owner).catch(() => undefined)
+    if (prev?.dir !== run.dir || prev?.status !== run.status) {
+      await $.store.set(RUN_KEY + run.owner, { dir: run.dir, slug: run.slug, cwd: run.cwd, status: run.status, at: now() }).catch(() => undefined)
+      for (const k of staleRunKeys(await storeRuns($), now())) await $.store.delete(k).catch(() => undefined)
+      othersAt = -Infinity
+    }
+  }
+  if (run.status !== 'running') await $.store.set('lastRun', run.dir).catch(() => undefined)
   const { routing, ...rest } = run
   await $.fs.write(`${run.dir}/run.json`, JSON.stringify(rest, null, 2) + '\n').catch(() => undefined)
   await $.fs.write(`${run.dir}/rounds.json`, JSON.stringify({ cap: run.cap, verdicts: run.verdicts }, null, 2) + '\n').catch(() => undefined)
@@ -1530,10 +1593,16 @@ export function register(on: any) {
     $.clock.every(120, () => {
       frame++
       if (frame % 3 === 0) void checkInbox($)
-      if (frame % 8 === 4) void syncConfig($)
+      if (frame % 40 === 4) void syncConfig($)
       if (paneOpen && run?.status === 'running') $.ui.invalidate('ui.render')
     })
     return r
+  })
+
+  on('session.end', async ($: any, e: any, next: any) => {
+    const sid = await mySid($)
+    if (home && sid) await $.process.run(['rm', '-f', statePath(home, sid)]).catch(() => undefined)
+    return next(e)
   })
 
   on('command.run', { command: 'forge' }, async ($: any, e: any) => {

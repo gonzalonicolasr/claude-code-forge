@@ -1,5 +1,5 @@
 import { expect, test, describe, mock } from 'claude-code/testing'
-import { zeroTarget, aliasOf, editZeroProfile, profileName, builtinModified, routeFor, phaseOfAgentType, parseVerdict, advance, slugify, parseStart, modelCatalog, groupOf, cleanMessages, thinkingByTool, stateSnapshot, exportStatus, DEFAULT_PROFILES, DEFAULT_EFFORTS, BUILTIN_PROFILES, cpamModel, claudeEffort, compareModels, zeroProfiles, isExcluded, effortBlocked, groupLabel, PHASES, phaseOrder, parseDecision, parseClarifyStatus, pickAnswer, forgeMayRun, modelUnavailable, section, parseTasks, validateTasks, buildBatches, nextWave, planUnits, normalizePath, samePath, tickTasks, waveEvidence, waveEnvelope, PARALLEL_MAX, parseSize, isNoddHandoff, noddHandoffProblem, parseContinue, adoptedRunResumable } from './logic.ts'
+import { otherRuns, staleRunKeys, statePath, zeroTarget, aliasOf, editZeroProfile, profileName, builtinModified, routeFor, phaseOfAgentType, parseVerdict, advance, slugify, parseStart, modelCatalog, groupOf, cleanMessages, thinkingByTool, stateSnapshot, exportStatus, DEFAULT_PROFILES, DEFAULT_EFFORTS, BUILTIN_PROFILES, cpamModel, claudeEffort, compareModels, zeroProfiles, isExcluded, effortBlocked, groupLabel, PHASES, phaseOrder, parseDecision, parseClarifyStatus, pickAnswer, forgeMayRun, modelUnavailable, section, parseTasks, validateTasks, buildBatches, nextWave, planUnits, normalizePath, samePath, tickTasks, waveEvidence, waveEnvelope, PARALLEL_MAX, parseSize, isNoddHandoff, noddHandoffProblem, parseContinue, adoptedRunResumable } from './logic.ts'
 import { PHASE_PROMPTS, finalInstruction, NODD_HINT, briefFor } from './prompts.ts'
 
 describe('ruteo', () => {
@@ -466,7 +466,7 @@ describe('build en tandas paralelas (hooks)', () => {
     const first = textOf(await call($))
     expect(first).toContain('build lote 1/3 listo')
     expect(first).toContain('make 3 Agent tool calls IN ONE SINGLE MESSAGE')
-    expect(w.files['/h/.local/state/forge/state.json'] && JSON.parse(w.files['/h/.local/state/forge/state.json']!).run.batch).toEqual({ index: 2, total: 3, tasks: ['T002', 'T003', 'T004'], parallel: true })
+    expect(w.files['/h/.local/state/forge/state-sesion.json'] && JSON.parse(w.files['/h/.local/state/forge/state-sesion.json']!).run.batch).toEqual({ index: 2, total: 3, tasks: ['T002', 'T003', 'T004'], parallel: true })
   }
 
   test('tres llamadas a la vez toman una tarea cada una, la de más se rechaza y la tanda cierra una sola vez', async ($, on) => {
@@ -623,7 +623,7 @@ describe('tamaño del pedido (hooks)', () => {
     expect(w.logs.filter((l) => l.includes('nodd.com.ar')).length).toBe(1)
     expect(w.asks).toEqual([])
     expect(JSON.parse(w.files[`${dir}/run.json`]!).size).toBe('small')
-    expect(JSON.parse(w.files['/h/.local/state/forge/state.json']!).run.size).toBe('small')
+    expect(JSON.parse(w.files['/h/.local/state/forge/state-sesion.json']!).run.size).toBe('small')
     await agent($, 'explore')
     await agent($, 'plan')
     expect(textOf(await agent($, 'build'))).toContain('forge:veredicto')
@@ -794,7 +794,7 @@ describe('continue tras recargar el mod (hooks)', () => {
     expect([saved.status, saved.expected, saved.note, saved.owner, saved.endedAt]).toEqual(['running', 'clarify', '', 'sesion', undefined])
     expect(w.files['/w/.sdd/nuevo/routing.log']!.startsWith('línea vieja\n')).toBe(true)
     expect(w.files['/w/.sdd/nuevo/routing.log']).toContain('retomado de run.json con /forge continue (estaba CORTADO: el turno principal terminó')
-    expect(JSON.parse(w.files['/h/.local/state/forge/state.json']!).run.slug).toBe('nuevo')
+    expect(JSON.parse(w.files['/h/.local/state/forge/state-sesion.json']!).run.slug).toBe('nuevo')
     await w.clock.advance(30)
     expect(w.submitted.length).toBe(1)
     expect(w.submitted[0]).toContain('subagent_type "forge:clarify"')
@@ -1344,7 +1344,7 @@ describe('handoff desde NODD', () => {
 describe('handoff desde NODD (hooks)', () => {
   const SLUG = 'login-magic-link'
   const DIR = `/w/.sdd/${SLUG}`
-  const STATE = '/h/.local/state/forge/state.json'
+  const STATE = '/h/.local/state/forge/state-sesion.json'
   const done = (text: string) => ({ result: { status: 'completed', agentId: 'a', content: [{ type: 'text', text }], totalToolUseCount: 0, totalDurationMs: 1, totalTokens: 0, usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, server_tool_use: null, service_tier: null, cache_creation: null }, prompt: 'p' } })
   const textOf = (r: any) => String(r?.result?.content?.[0]?.text ?? r?.text ?? r?.deny ?? '')
   const agent = ($: any, phase: string) => $.tool.call({ tool: 'Agent', subagent_type: `forge:${phase}`, description: `forge ${phase}`, prompt: 'x' })
@@ -1555,5 +1555,89 @@ describe('handoff desde NODD (hooks)', () => {
     const saved = JSON.parse(w.files[`${DIR}/run.json`]!)
     expect([saved.origin, saved.expected, saved.order[0]]).toEqual(['nodd', 'plan', 'explore'])
     expect(JSON.parse(w.files[STATE]!).run.origin).toBe('nodd')
+  })
+})
+
+describe('un run por sesión (hooks)', () => {
+  const OTHER = '/r/.sdd/mejoras-de-fps'
+  const stat = { status: 'pending', model: 'm', answeredBy: '', ms: 0, startedAt: 0, inTok: 0, outTok: 0, steps: 0 }
+  const otherRun = JSON.stringify({
+    slug: 'mejoras-de-fps', dir: OTHER, cwd: '/r', request: 'fps', mode: 'automatic', cap: 3, verdicts: [], expected: 'build', status: 'running',
+    order: ['explore', 'plan', 'build', 'veredicto'], startedAt: 1, stats: Object.fromEntries(PHASES.map((p) => [p, stat])), decisions: [], clarified: false,
+    tdd: 'strict', unitIdx: 0, delivered: [], retryAlone: [], flights: { 'agente-de-otra': { phase: 'build', agentId: 'agente-de-otra' } }, retried: false, note: '', awaitTurn: false, asyncSeen: false, owner: 'otra',
+  })
+  const forge = async ($: any, args: string) => String(((await $.command.run({ command: 'forge', args })) as any).text)
+
+  function world(on: any, sid: string, store: Record<string, unknown>) {
+    mock.env(on, { HOME: '/h' })
+    on('store.get', async (_$: any, e: any) => ({ value: store[e.key] === undefined ? undefined : JSON.parse(JSON.stringify(store[e.key])) }))
+    on('store.set', async (_$: any, e: any) => {
+      store[e.key] = JSON.parse(JSON.stringify(e.value))
+      return { value: undefined }
+    })
+    on('store.delete', async (_$: any, e: any) => {
+      delete store[e.key]
+      return { value: undefined }
+    })
+    on('store.keys', async () => ({ value: Object.keys(store) }))
+    mock.clock(on)
+    const files: Record<string, string> = { [`${OTHER}/run.json`]: otherRun, [`${OTHER}/routing.log`]: 'log de la otra\n' }
+    on('fs.read', async (_$: any, e: any) => ({ value: files[e.path] ?? '' }))
+    on('fs.write', async (_$: any, e: any) => {
+      files[e.path] = e.text
+      return { value: undefined }
+    })
+    on('fs.list', async () => ({ deny: 'no existe' }))
+    on('fs.stat', async () => ({ deny: 'no existe' }))
+    on('process.run', async () => ({ value: { exitCode: 0, stdout: '/w\n/w/.git\n/w/.git', stderr: '' } }))
+    on('command.list', async () => ({ value: [] }))
+    on('ui.log', async () => ({ value: undefined }))
+    on('session.cwd', async () => ({ value: '/w' }))
+    on('session.id', async () => ({ value: sid }))
+    on('prompt.submit', async () => ({ drop: '' }))
+    return files
+  }
+
+  test('con el run de otra sesión corriendo (store viejo con activeRun), esta no lo ve, arranca el suyo y lo muestra aparte', async ($, on) => {
+    const store: Record<string, unknown> = { activeRun: OTHER, lastRun: OTHER }
+    const files = world(on, 'sesion', store)
+    expect(await forge($, 'status')).toContain('sin runs en esta sesión')
+    const { at: _at, ...migrated } = store['run:otra'] as any
+    expect([store.activeRun, migrated]).toEqual([undefined, { dir: OTHER, slug: 'mejoras-de-fps', cwd: '/r', status: 'running' }])
+    const start = await forge($, '--auto agregá un botón')
+    expect(start.startsWith('run agrega-un-boton')).toBe(true)
+    expect(start).not.toContain('ya hay un run')
+    const mine: any = store['run:sesion']
+    expect([mine.dir, mine.status]).toEqual(['/w/.sdd/agrega-un-boton', 'running'])
+    const state = JSON.parse(files['/h/.local/state/forge/state-sesion.json']!)
+    expect([state.run.slug, state.others]).toEqual(['agrega-un-boton', [{ slug: 'mejoras-de-fps', project: 'r', status: 'running' }]])
+    expect(files['/h/.local/state/forge/state.json']).toBe(undefined)
+    expect(files[`${OTHER}/run.json`]).toBe(otherRun)
+    expect(files[`${OTHER}/routing.log`]).toBe('log de la otra\n')
+    expect(await forge($, 'stop')).not.toContain('mejoras-de-fps')
+    expect(files[`${OTHER}/run.json`]).toBe(otherRun)
+  })
+
+  test('la sesión dueña retoma su run después del reload, desde el store viejo o desde run:<sesión>, y no ve el de la otra', async ($, on) => {
+    const store: Record<string, unknown> = { activeRun: OTHER }
+    const files = world(on, 'otra', store)
+    expect(await forge($, 'status')).toContain('run mejoras-de-fps · CORRIENDO')
+    const state = JSON.parse(files['/h/.local/state/forge/state-otra.json']!)
+    expect([state.run.slug, state.others]).toEqual(['mejoras-de-fps', []])
+    expect([(store['run:otra'] as any).dir, store.activeRun]).toEqual([OTHER, undefined])
+  })
+
+  test('otherRuns lista sólo los runs corriendo de las otras sesiones; staleRunKeys limpia los viejos', () => {
+    const day = 86400000
+    const runs = {
+      'run:yo': { dir: '/a/.sdd/x', slug: 'x', cwd: '/a', status: 'running', at: 10 * day },
+      'run:rpg': { dir: '/p/ascii-rpg/.sdd/fps', slug: 'fps', cwd: '/p/ascii-rpg', status: 'running', at: 10 * day },
+      'run:vieja': { dir: '/b/.sdd/y', slug: 'y', cwd: '/b', status: 'pasa', at: 8 * day },
+      'run:colgada': { dir: '/c/.sdd/z', slug: 'z', cwd: '/c', status: 'running', at: 1 },
+      config: { mode: 'automatic' },
+    }
+    expect(otherRuns(runs, 'yo', 10 * day)).toEqual([{ slug: 'fps', project: 'ascii-rpg', status: 'running' }])
+    expect(staleRunKeys(runs, 10 * day)).toEqual(['run:vieja', 'run:colgada'])
+    expect([statePath('/h', 'abc'), statePath('/h', '')]).toEqual(['/h/.local/state/forge/state-abc.json', '/h/.local/state/forge/state.json'])
   })
 })

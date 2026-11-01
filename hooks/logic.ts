@@ -687,8 +687,41 @@ export type StateInput = {
   modelIds: readonly string[]
   labels?: Readonly<Record<string, string>>
   run?: RunView
+  others?: readonly OtherRun[]
   asking: boolean
   now: number
+}
+
+// Un run de otra sesión, como lo guarda cada una en el store bajo run:<sessionId>.
+export type RunEntry = { dir: string; slug: string; cwd: string; status: string; at: number }
+export type OtherRun = { slug: string; project: string; status: string }
+export const RUN_KEY = 'run:'
+const RUNNING_STALE = 7 * 86400000
+const DONE_STALE = 86400000
+
+export function statePath(home: string, sessionId: string): string {
+  return `${home}/.local/state/forge/${sessionId ? `state-${sessionId}.json` : 'state.json'}`
+}
+
+export function isRunEntry(v: unknown): v is RunEntry {
+  return !!v && typeof v === 'object' && typeof (v as any).dir === 'string' && !!(v as any).dir
+}
+
+// Los runs de las otras sesiones que siguen corriendo, para la línea «otros» del panel.
+export function otherRuns(entries: Record<string, unknown>, sessionId: string, at: number): OtherRun[] {
+  const out: OtherRun[] = []
+  for (const [key, e] of Object.entries(entries)) {
+    if (!key.startsWith(RUN_KEY) || key === RUN_KEY + sessionId || !isRunEntry(e) || e.status !== 'running' || at - (Number(e.at) || 0) > RUNNING_STALE) continue
+    out.push({ slug: e.slug, project: String(e.cwd || '').replace(/\/+$/, '').split('/').pop() || e.cwd, status: e.status })
+  }
+  return out
+}
+
+// Las entradas run:<sesión> viejas que ya no sirven: terminadas hace más de un día o "corriendo" hace más de una semana.
+export function staleRunKeys(entries: Record<string, unknown>, at: number): string[] {
+  return Object.entries(entries)
+    .filter(([k, e]) => k.startsWith(RUN_KEY) && (!isRunEntry(e) || at - (Number(e.at) || 0) > (e.status === 'running' ? RUNNING_STALE : DONE_STALE)))
+    .map(([k]) => k)
 }
 
 export function exportStatus(status: RunStatus, asking: boolean): ExportStatus {
@@ -770,6 +803,7 @@ export function stateSnapshot(i: StateInput) {
     labels,
     effortNotes,
     run,
+    others: [...(i.others || [])],
     updatedAt: i.now,
   }
 }
