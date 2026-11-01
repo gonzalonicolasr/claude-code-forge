@@ -1022,8 +1022,16 @@ async function parallelCount($: any, phase: Phase | undefined): Promise<number> 
 
 const unitFlights = (r: Run, u: Unit) => Object.values(r.flights).filter((f) => f.phase === 'build' && f.task && u.tasks.includes(f.task)).length
 
-function childResult(agentId: string | undefined, content: any, denied?: string): WaveResult {
+function agentFailure(r: any): string | undefined {
+  if (r?.deny) return undefined
+  if (!r?.isError && r?.result?.status === 'completed') return undefined
+  const said = String(r?.text || (typeof r?.result === 'string' ? r.result : '') || '').trim()
+  return clip(said || `the Agent tool came back without a completed result (${r?.result?.status || 'no result'})`, 300)
+}
+
+function childResult(agentId: string | undefined, content: any, denied?: string, failed?: string): WaveResult {
   if (denied) return { ok: false, text: '', reason: `refused: ${clip(denied, 200)}` }
+  if (failed) return { ok: false, text: '', reason: `Agent tool error: ${clip(failed, 200)}` }
   const answer = phaseAnswer('build', agentId, content)
   if (answer.startsWith('FORGE_CPAM_ERROR')) return { ok: false, text: clip(answer, 2000), reason: answer.split('\n')[0] }
   if (!answer.trim()) return { ok: false, text: '', reason: 'the build envelope came back empty' }
@@ -1068,12 +1076,12 @@ async function closeWave($: any, unit: Unit): Promise<string> {
 
 type Closed = { body: string; delivered: string[]; failed: { id: string; reason: string }[]; note: string }
 
-async function finishPhase($: any, phase: Phase, agentId: string | undefined, content: any, closed?: Closed) {
+async function finishPhase($: any, phase: Phase, agentId: string | undefined, content: any, closed?: Closed, agentError?: string) {
   if (!run) return 'forge: sin run'
   const st = run.stats[phase]
   st.ms = now() - st.startedAt
   const answer = closed ? closed.body : phaseAnswer(phase, agentId, content)
-  const cpamFailed = !closed && answer.startsWith('FORGE_CPAM_ERROR')
+  const cpamFailed = !closed && (!!agentError || answer.startsWith('FORGE_CPAM_ERROR'))
   const round = run.verdicts.length + 1
   const unit = phase === 'build' ? run.unit : undefined
   const batch = unit && !unit.whole ? { index: unit.index, total: unit.total, parallel: unit.parallel, tasks: unit.tasks } : undefined
@@ -1083,7 +1091,7 @@ async function finishPhase($: any, phase: Phase, agentId: string | undefined, co
   let stopNow = false
   if (cpamFailed) {
     outcome = 'fail'
-    reason = answer.split('\n')[0]
+    reason = agentError ? `the Agent tool failed: ${agentError}` : answer.split('\n')[0]
   } else if (phase === 'clarify') {
     const status = parseClarifyStatus(answer)
     if (answer.trim().length < 40 || !status) {
@@ -1220,6 +1228,7 @@ async function finishPhase($: any, phase: Phase, agentId: string | undefined, co
   if (run.status !== 'running') {
     run.endedAt = now()
     run.expected = run.status === 'parado' ? step.next : undefined
+    if (run.status === 'fallido') run.note = `${phase} no entregó dos veces: ${reason}`
     run.routing.push(`${stamp()} fin: ${STATUS_LABEL[run.status]} · veredictos ${run.verdicts.join(' → ') || '—'} · analyze ${run.decisions.join(' → ') || '—'}`)
   } else if (!nextUnit) run.stats[step.next as Phase] = { ...blankStat(config.models[step.next as Phase], config.efforts[step.next as Phase]) }
   const parallel = run.status === 'running' ? await parallelCount($, step.next) : 1
@@ -1598,10 +1607,11 @@ export function register(on: any) {
         ],
       }
     }
+    const failed = agentFailure(r)
     if (unit?.parallel && task) {
       const denied = 'deny' in r && r.deny ? String(r.deny) : undefined
-      const done = await childDone($, key, unit, task, childResult(r?.result?.agentId, r?.result?.content, denied))
-      return denied ? { deny: done.text } : { result: { ...r.result, content: [{ type: 'text', text: done.text }] } }
+      const done = await childDone($, key, unit, task, childResult(r?.result?.agentId, r?.result?.content, denied, failed))
+      return denied || failed ? { deny: done.text } : { result: { ...r.result, content: [{ type: 'text', text: done.text }] } }
     }
     delete run.flights[key]
     if ('deny' in r && r.deny) {
@@ -1614,8 +1624,9 @@ export function register(on: any) {
       $.ui.invalidate('ui.render')
       return { deny: finalInstruction(`${phase} was refused (${r.deny}). Outcome: FAILED, NOT verified.`, run.size) }
     }
-    const text = await finishPhase($, phase, r.result?.agentId, r.result?.content)
-    return { result: { ...r.result, content: [{ type: 'text', text }] } }
+    if (failed) run.routing.push(`${stamp()} ${phase}: la tool Agent volvió con error, sin resultado completo (${failed})`)
+    const text = await finishPhase($, phase, failed ? undefined : r.result?.agentId, failed ? undefined : r.result?.content, undefined, failed)
+    return failed ? { deny: text } : { result: { ...r.result, content: [{ type: 'text', text }] } }
   })
 
   on('turn.step', async function* ($: any, e: any, next: any) {

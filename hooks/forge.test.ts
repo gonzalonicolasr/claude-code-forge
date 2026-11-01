@@ -665,6 +665,72 @@ describe('tamaño del pedido (hooks)', () => {
   })
 })
 
+describe('una fase que falla (hooks)', () => {
+  const done = (text: string) => ({ result: { status: 'completed', agentId: 'a', content: [{ type: 'text', text }], totalToolUseCount: 0, totalDurationMs: 1, totalTokens: 0, usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, server_tool_use: null, service_tier: null, cache_creation: null }, prompt: 'p' } })
+  const textOf = (r: any) => String(r?.result?.content?.[0]?.text ?? r?.text ?? r?.deny ?? '')
+  const clarify = ($: any) => $.tool.call({ tool: 'Agent', subagent_type: 'forge:clarify', description: 'forge clarify', prompt: 'x' })
+  const AGENT_FIELDS = ['agentId', 'content', 'totalToolUseCount', 'totalDurationMs', 'totalTokens', 'usage', 'status', 'prompt']
+  const agentShapeOk = (r: any) =>
+    typeof r?.deny === 'string'
+      ? r.result === undefined
+      : r?.result?.status === 'completed' && AGENT_FIELDS.every((f) => r.result[f] !== undefined) && r.result.content.every((b: any) => b.type === 'text' && typeof b.text === 'string')
+
+  async function world($: any, on: any, answers: any[]) {
+    mock.env(on, { HOME: '/h' })
+    mock.store(on)
+    const clock = mock.clock(on)
+    const files: Record<string, string> = {}
+    on('fs.read', async (_$: any, e: any) => ({ value: files[e.path] ?? '' }))
+    on('fs.write', async (_$: any, e: any) => {
+      files[e.path] = e.text
+      return { value: undefined }
+    })
+    on('fs.list', async () => ({ value: [] }))
+    on('fs.stat', async () => ({ deny: 'no existe' }))
+    on('process.run', async () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+    on('command.list', async () => ({ value: [] }))
+    on('ui.log', async () => ({ value: undefined }))
+    on('tool.call', { tool: 'Agent' }, async () => answers.shift())
+    on('session.cwd', async () => ({ value: '/w' }))
+    on('session.id', async () => ({ value: 'sesion' }))
+    on('prompt.submit', async () => ({ drop: '' }))
+    await $.command.run({ command: 'forge', args: 'phase clarify on' })
+    const r: any = await $.command.run({ command: 'forge', args: '--auto busca mejoras de performance' })
+    await clock.advance(30)
+    const dir = `/w/.sdd/${String(r.text).split(' ')[1]}`
+    return { files, saved: () => JSON.parse(files[`${dir}/run.json`]!), log: () => files[`${dir}/routing.log`]! }
+  }
+
+  test('clarify vacío o sin ## Status devuelve un resultado de Agent válido: primero reintenta, después FALLÓ con nota', async ($, on) => {
+    const w = await world($, on, [done(''), done('no tengo nada para decir sobre este pedido, perdón por eso')])
+    const first: any = await clarify($)
+    expect(agentShapeOk(first)).toBe(true)
+    expect(textOf(first)).toContain('clarify falló')
+    expect(textOf(first)).toContain('Next: call the Agent tool with subagent_type "forge:clarify"')
+    expect([w.saved().status, w.saved().expected, w.saved().retried]).toEqual(['running', 'clarify', true])
+    const second: any = await clarify($)
+    expect(agentShapeOk(second)).toBe(true)
+    expect(textOf(second)).toContain('Outcome: FAILED: clarify did not deliver twice')
+    expect(w.saved().status).toBe('fallido')
+    expect(w.saved().note).toContain('clarify no entregó dos veces: clarifications came back without a "## Status"')
+  })
+
+  test('si la tool Agent vuelve con error y sin resultado completo, forge niega con la instrucción en vez de armar un resultado roto', async ($, on) => {
+    const limit = { isError: true, result: "You've hit your weekly limit", text: "You've hit your weekly limit" }
+    const w = await world($, on, [limit, { result: { content: [] } }])
+    const first: any = await clarify($)
+    expect(agentShapeOk(first)).toBe(true)
+    expect(first.deny).toContain("the Agent tool failed: You've hit your weekly limit")
+    expect(first.deny).toContain('Next: call the Agent tool with subagent_type "forge:clarify"')
+    expect([w.saved().status, w.saved().expected, w.saved().retried, w.saved().flights]).toEqual(['running', 'clarify', true, {}])
+    expect(w.log()).toContain('la tool Agent volvió con error')
+    const second: any = await clarify($)
+    expect(agentShapeOk(second)).toBe(true)
+    expect(second.deny).toContain('Outcome: FAILED')
+    expect([w.saved().status, w.saved().stats.clarify.status]).toEqual(['fallido', 'error'])
+  })
+})
+
 describe('arranque', () => {
   test('slug corto, sin tildes y sin pisar runs existentes', () => {
     expect(slugify('Agregá una función suma(a, b)')).toBe('agrega-una-funcion-suma-a-b')
