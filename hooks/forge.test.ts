@@ -731,6 +731,103 @@ describe('una fase que falla (hooks)', () => {
   })
 })
 
+describe('continue tras recargar el mod (hooks)', () => {
+  const stat = { status: 'pending', model: 'm', effort: 'auto', answeredBy: '', ms: 0, startedAt: 0, inTok: 0, outTok: 0, steps: 0 }
+  const cut = (slug: string, endedAt: number, extra: any = {}) =>
+    JSON.stringify({
+      slug, dir: `/w/.sdd/${slug}`, cwd: '/w', request: `pedido ${slug}`, mode: 'automatic', cap: 3, verdicts: [], expected: 'clarify', status: 'cortado',
+      order: [...PHASES], decisions: [], clarified: false, tdd: 'strict', unitIdx: 0, delivered: [], retryAlone: [], flights: {}, startedAt: endedAt - 1000,
+      stats: Object.fromEntries(PHASES.map((p) => [p, stat])), retried: true, note: 'el turno principal terminó antes de cerrar el run · /forge continue',
+      awaitTurn: false, asyncSeen: false, owner: 'otra-sesion', endedAt, ...extra,
+    })
+  const forge = async ($: any, args: string) => String(((await $.command.run({ command: 'forge', args })) as any).text)
+
+  async function world($: any, on: any, seed: Record<string, string> = {}) {
+    mock.env(on, { HOME: '/h' })
+    mock.store(on)
+    const clock = mock.clock(on)
+    const files: Record<string, string> = { ...seed }
+    const submitted: string[] = []
+    const logs: string[] = []
+    on('fs.read', async (_$: any, e: any) => ({ value: files[e.path] ?? '' }))
+    on('fs.write', async (_$: any, e: any) => {
+      files[e.path] = e.text
+      return { value: undefined }
+    })
+    on('fs.list', async (_$: any, e: any) => {
+      const pre = `${String(e.path).replace(/\/$/, '')}/`
+      const kids = new Map<string, string>()
+      for (const f of Object.keys(files)) {
+        if (!f.startsWith(pre)) continue
+        const [name, ...more] = f.slice(pre.length).split('/')
+        kids.set(name!, more.length ? 'dir' : 'file')
+      }
+      return kids.size ? { value: [...kids].map(([name, kind]) => ({ name, kind })) } : { deny: 'no existe' }
+    })
+    on('fs.stat', async (_$: any, e: any) => (e.path in files ? { value: { kind: 'file', size: files[e.path]!.length, mtimeMs: Date.now() } } : { deny: 'no existe' }))
+    on('process.run', async () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+    on('command.list', async () => ({ value: [] }))
+    on('ui.log', async (_$: any, e: any) => {
+      logs.push(String(e.text ?? JSON.stringify(e)))
+      return { value: undefined }
+    })
+    on('session.cwd', async () => ({ value: '/w' }))
+    on('session.id', async () => ({ value: 'sesion' }))
+    on('prompt.submit', async (_$: any, e: any) => {
+      submitted.push(e.text)
+      return { drop: '' }
+    })
+    on('turn.start', async (_$: any, e: any) => ({ turnId: e.turnId }))
+    on('turn.complete', async (_$: any, e: any) => ({ text: e.answer }))
+    return { clock, files, submitted, logs }
+  }
+
+  test('sin slug retoma de disco el run cortado más reciente desde la fase que faltaba, con su routing.log', async ($, on) => {
+    const w = await world($, on, {
+      '/w/.sdd/viejo/run.json': cut('viejo', 1000),
+      '/w/.sdd/nuevo/run.json': cut('nuevo', 5000),
+      '/w/.sdd/nuevo/routing.log': 'línea vieja\n',
+      '/w/.sdd/termino/run.json': cut('termino', 9000, { status: 'pasa', expected: undefined }),
+    })
+    expect(await forge($, 'continue')).toBe('sigo nuevo desde clarify (recuperado de /w/.sdd/nuevo/run.json)')
+    const saved = JSON.parse(w.files['/w/.sdd/nuevo/run.json']!)
+    expect([saved.status, saved.expected, saved.note, saved.owner, saved.endedAt]).toEqual(['running', 'clarify', '', 'sesion', undefined])
+    expect(w.files['/w/.sdd/nuevo/routing.log']!.startsWith('línea vieja\n')).toBe(true)
+    expect(w.files['/w/.sdd/nuevo/routing.log']).toContain('retomado de run.json con /forge continue (estaba CORTADO: el turno principal terminó')
+    expect(JSON.parse(w.files['/h/.local/state/forge/state.json']!).run.slug).toBe('nuevo')
+    await w.clock.advance(30)
+    expect(w.submitted.length).toBe(1)
+    expect(w.submitted[0]).toContain('subagent_type "forge:clarify"')
+    expect(JSON.parse(w.files['/w/.sdd/viejo/run.json']!).status).toBe('cortado')
+  })
+
+  test('con slug retoma ese run de disco, también uno parado; uno terminado no se retoma', async ($, on) => {
+    const w = await world($, on, {
+      '/w/.sdd/viejo/run.json': cut('viejo', 1000, { status: 'parado', expected: 'plan' }),
+      '/w/.sdd/nuevo/run.json': cut('nuevo', 5000),
+      '/w/.sdd/termino/run.json': cut('termino', 9000, { status: 'fallido', expected: undefined }),
+    })
+    expect(await forge($, 'continue termino')).toContain('no adopto .sdd/termino')
+    expect(await forge($, 'continue viejo')).toBe('sigo viejo desde plan (recuperado de /w/.sdd/viejo/run.json)')
+    await w.clock.advance(30)
+    expect(w.submitted.at(-1)).toContain('subagent_type "forge:plan"')
+    expect(await forge($, 'continue nuevo')).toBe('ya hay un run corriendo (viejo). /forge stop para cortarlo.')
+  })
+
+  test('si el turno principal muere por un error de la API, el run queda cortado con la razón y continue lo retoma', async ($, on) => {
+    const w = await world($, on)
+    expect(await forge($, '--auto agregá suma')).toContain('run agrega-suma')
+    await w.clock.advance(30)
+    await $.turn.start({ turnId: 'main', text: 'x' } as any)
+    await $.turn.complete({ turnId: 'main', reason: 'error', answer: "You've hit your weekly limit", durationMs: 1, isAborted: false } as any)
+    const saved = JSON.parse(w.files['/w/.sdd/agrega-suma/run.json']!)
+    expect([saved.status, saved.expected]).toEqual(['cortado', 'clarify'])
+    expect(saved.note).toBe("el turno principal se cortó por un error de la API (You've hit your weekly limit) antes de cerrar el run · /forge continue")
+    expect(w.logs.some((l) => l.includes('weekly limit'))).toBe(true)
+    expect(await forge($, 'continue')).toBe('sigo agrega-suma desde clarify')
+  })
+})
+
 describe('arranque', () => {
   test('slug corto, sin tildes y sin pisar runs existentes', () => {
     expect(slugify('Agregá una función suma(a, b)')).toBe('agrega-una-funcion-suma-a-b')

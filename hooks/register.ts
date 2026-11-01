@@ -498,19 +498,56 @@ async function restoreRun($: any, agentId?: string) {
     for (const [k, f] of Object.entries((saved.flights || {}) as Record<string, Flight>)) if (f?.agentId) flights[k] = f
     if (typeof saved.inFlight === 'string' && saved.inFlight !== 'sync') flights[saved.inFlight] = { phase: saved.expected, agentId: saved.inFlight }
     if (!(saved.owner && saved.owner === sid) && !(agentId && flights[agentId])) return
-    const log = String((await $.fs.read(`${dir}/routing.log`).catch(() => '')) || '')
-    const { inFlight: _f, batches: _b, batchIdx: _i, ...keep } = saved
-    run = {
-      ...keep,
-      flights,
-      unitIdx: Number(saved.unitIdx) || 0,
-      delivered: Array.isArray(saved.delivered) ? saved.delivered : [],
-      retryAlone: Array.isArray(saved.retryAlone) ? saved.retryAlone : [],
-      routing: [...log.split('\n').filter(Boolean), `${stamp()} forge se recargó a mitad del run; sigue desde ${saved.phase || 'la fase en curso'}`],
-    } as Run
+    run = await hydrate($, dir, saved, flights, `forge se recargó a mitad del run; sigue desde ${saved.phase || 'la fase en curso'}`)
     await exportState($)
     $.ui.invalidate('ui.render')
   } catch {}
+}
+
+async function hydrate($: any, dir: string, saved: any, flights: Record<string, Flight>, line: string): Promise<Run> {
+  const log = String((await $.fs.read(`${dir}/routing.log`).catch(() => '')) || '')
+  const { inFlight: _f, batches: _b, batchIdx: _i, ...keep } = saved
+  return {
+    ...keep,
+    flights,
+    unitIdx: Number(saved.unitIdx) || 0,
+    delivered: Array.isArray(saved.delivered) ? saved.delivered : [],
+    retryAlone: Array.isArray(saved.retryAlone) ? saved.retryAlone : [],
+    routing: [...log.split('\n').filter(Boolean), `${stamp()} ${line}`],
+  } as Run
+}
+
+async function stoppedOnDisk($: any, dir: string): Promise<any | undefined> {
+  try {
+    const saved = JSON.parse(String((await $.fs.read(`${dir}/run.json`).catch(() => '')) || ''))
+    const ok =
+      (saved?.status === 'cortado' || saved?.status === 'parado') &&
+      typeof saved.slug === 'string' &&
+      saved.dir === dir &&
+      typeof saved.cwd === 'string' &&
+      typeof saved.request === 'string' &&
+      Array.isArray(saved.order) &&
+      saved.order.includes(saved.expected) &&
+      saved.stats &&
+      typeof saved.stats === 'object'
+    return ok ? saved : undefined
+  } catch {
+    return undefined
+  }
+}
+
+async function findStopped($: any, base: string, slug: string): Promise<{ dir: string; saved: any } | undefined> {
+  const last = await $.store.get('lastRun').catch(() => undefined)
+  const dirs = new Set<string>()
+  if (typeof last === 'string' && last && (!slug || last.split('/').pop() === slug)) dirs.add(last)
+  if (base && slug) dirs.add(`${base}/.sdd/${slug}`)
+  else if (base) for (const d of ((await $.fs.list(`${base}/.sdd`).catch(() => [])) as any[]).filter((x: any) => x?.kind === 'dir')) dirs.add(`${base}/.sdd/${d.name}`)
+  let best: { dir: string; saved: any } | undefined
+  for (const dir of dirs) {
+    const saved = await stoppedOnDisk($, dir)
+    if (saved && (!best || (Number(saved.endedAt || saved.startedAt) || 0) > (Number(best.saved.endedAt || best.saved.startedAt) || 0))) best = { dir, saved }
+  }
+  return best
 }
 
 async function persist($: any) {
@@ -518,6 +555,7 @@ async function persist($: any) {
   if (!run) return
   if (!run.owner) run.owner = await $.session.id().catch(() => undefined)
   await $.store.set('activeRun', run.status === 'running' ? run.dir : null).catch(() => undefined)
+  await $.store.set('lastRun', run.dir).catch(() => undefined)
   const { routing, ...rest } = run
   await $.fs.write(`${run.dir}/run.json`, JSON.stringify(rest, null, 2) + '\n').catch(() => undefined)
   await $.fs.write(`${run.dir}/rounds.json`, JSON.stringify({ cap: run.cap, verdicts: run.verdicts }, null, 2) + '\n').catch(() => undefined)
@@ -702,7 +740,8 @@ async function readHandoff($: any, cwd: string, slug: string): Promise<Handoff |
 async function continueRun($: any, args: string): Promise<{ text: string; started: boolean }> {
   const parsed = parseContinue(args)
   if (!parsed || 'error' in parsed) return { text: parsed?.error || 'uso: /forge continue [<slug>]', started: false }
-  if (run && run.expected && (run.status === 'parado' || run.status === 'cortado') && (!parsed.slug || parsed.slug === run.slug)) {
+  const resume = async (from = '') => {
+    if (!run?.expected) return { text: 'forge: sin run', started: false }
     run.status = 'running'
     run.note = ''
     run.endedAt = undefined
@@ -710,10 +749,17 @@ async function continueRun($: any, args: string): Promise<{ text: string; starte
     if (run.unit) Object.assign(run.unit, { claimed: [], results: {} })
     run.stats[run.expected] = blankStat(config.models[run.expected], config.efforts[run.expected])
     await persist($)
-    return { text: `sigo ${run.slug} desde ${run.expected}`, started: true }
+    return { text: `sigo ${run.slug} desde ${run.expected}${from}`, started: true }
   }
+  if (run && run.expected && (run.status === 'parado' || run.status === 'cortado') && (!parsed.slug || parsed.slug === run.slug)) return resume()
   if (run && run.status === 'running') return { text: `ya hay un run corriendo (${run.slug}). /forge stop para cortarlo.`, started: false }
   const cwd = await $.session.cwd().catch(() => '')
+  const stopped = await findStopped($, cwd, parsed.slug)
+  if (stopped) {
+    run = await hydrate($, stopped.dir, stopped.saved, {}, `retomado de run.json con /forge continue (estaba ${STATUS_LABEL[stopped.saved.status as RunStatus]}${stopped.saved.note ? `: ${stopped.saved.note}` : ''})`)
+    run.owner = await $.session.id().catch(() => undefined)
+    return resume(` (recuperado de ${stopped.dir}/run.json)`)
+  }
   let handoff: Handoff | undefined
   if (parsed.slug) {
     const found = cwd ? await readHandoff($, cwd, parsed.slug) : { why: 'no sé en qué directorio está la sesión' }
@@ -1751,10 +1797,20 @@ export function register(on: any) {
       return next(e)
     }
     if (run && run.status === 'running' && !Object.keys(run.flights).length && !run.asyncSeen && run.turnId && e.turnId === run.turnId) {
+      const said = clip(String((e.reason === 'refusal' ? e.refusal?.explanation : e.answer) || '').replace(/\s+/g, ' ').trim(), 200)
+      const why =
+        e.reason === 'error'
+          ? `el turno principal se cortó por un error de la API${said ? ` (${said})` : ''}`
+          : e.reason === 'refusal'
+            ? `el modelo principal se negó a seguir${said ? ` (${said})` : ''}`
+            : e.reason === 'aborted'
+              ? 'el turno principal se interrumpió'
+              : 'el turno principal terminó'
       run.status = 'cortado'
       run.endedAt = now()
-      run.note = 'el turno principal terminó antes de cerrar el run · /forge continue'
+      run.note = `${why} antes de cerrar el run · /forge continue`
       run.routing.push(`${stamp()} ${run.note}`)
+      $.ui.log(`forge: run ${run.slug} cortado: ${run.note}`)
       await persist($)
       $.ui.invalidate('ui.render')
     }

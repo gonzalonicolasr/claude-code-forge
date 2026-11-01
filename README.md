@@ -20,7 +20,7 @@ claude --plugin-dir ~/projects/forge
 | `/forge` o `/forge ui` | Abre el panel FORGE (con NERV cargado, un run nuevo no lo abre solo: se sigue en la pestaña FORGE de NERV) |
 | `/forge status` | Modelos por fase, estado del run, tiempos y tokens |
 | `/forge stop` | Corta el run (funciona en medio de un turno) |
-| `/forge continue [<slug>]` (o `seguir`) | Retoma un run parado o cortado desde la fase que faltaba. Con `<slug>`, o sin slug y sin run parado, **adopta un handoff de NODD** (ver abajo). Acepta `--auto` / `--interactive`, `--cap N` y `--profile` para el run adoptado |
+| `/forge continue [<slug>]` (o `seguir`) | Retoma un run parado o cortado desde la fase que faltaba. Si el mod se recargó y el run ya no está en memoria, lo levanta de su `run.json` (sin slug, el cortado o parado más reciente; con `<slug>`, ese). Si no hay ninguno, **adopta un handoff de NODD** (ver abajo). Acepta `--auto` / `--interactive`, `--cap N` y `--profile` para el run adoptado |
 | `/forge profile [nombre]` · `/forge profile save <nombre>` · `/forge profile delete <nombre>` | Ver, activar, guardar o borrar perfiles (los de fábrica no se borran) |
 | `/forge model <fase> <modelo>` | Cambia el modelo de una fase (`clarify`, `explore`, `plan`, `analyze`, `build`, `veredicto`) |
 | `/forge phase <clarify\|analyze> <on\|off>` | Activa o saltea uno de los dos gates (en el panel: botón *saltear* / *activar*). Las otras cuatro fases no se pueden saltear |
@@ -148,7 +148,8 @@ El veredicto tiene que terminar en `VEREDICTO: pasa|corregir|replantear` (`parse
 - Gemini 3 por el CPAM devuelve un bloque `thinking` con firma (`cpa-gemini-carrier-v1`) antes de cada `tool_use`. El motor no guarda el thinking de un paso hecho por un hook, así que forge lo cachea por id de tool_use y lo vuelve a poner en el paso siguiente.
 - El `Select` acepta como máximo 64 opciones (con más, el motor rechaza el render del pane).
 - `$.tool.list()` no trae los input schemas: los de Bash, Read, Glob, Grep, Edit y Write están declarados a mano en `register.ts`.
-- Al guardar un archivo del mod con `--plugin-dir` en la REPL, el mod se recarga y **pierde el run en memoria**. El estado queda en `.sdd/<slug>/run.json` pero no se rehidrata.
+- Al guardar un archivo del mod con `--plugin-dir` en la REPL, el mod se recarga y **pierde el run en memoria**. El estado queda en `.sdd/<slug>/run.json`: un run que seguía corriendo se rehidrata solo en el próximo paso de su fase, y uno cortado o parado se levanta con `/forge continue`, que busca en el `.sdd/` del directorio de la sesión y en el último run que guardó forge (clave `lastRun` del store).
+- Si el turno principal termina con el run a medias, el run queda **CORTADO** y la nota dice por qué: un error de la API (por ejemplo «You've hit your weekly limit», si viene en la respuesta), una negativa del modelo, una interrupción o un fin de turno normal (`reason` de `turn.complete`). Se retoma con `/forge continue`.
 
 ## Desarrollo
 
@@ -161,13 +162,12 @@ Archivos: `hooks/register.ts` (hooks y panel), `hooks/logic.ts` (lógica pura te
 
 ## Pendiente
 
-- Rehidratar un run desde `run.json` después de un reload del mod.
 - En segundo plano, el motor igual le avisa al modelo principal cuando termina el agente, y eso le suma un turno corto por fase en tu plan de Claude.
 - Lo que zero-pi tiene y forge todavía no:
   - `/zero-checkpoint` antes de cada build (parche de restauración en `.sdd/<slug>/checkpoints/`).
   - El ledger de ejecución (`zero_execution`: `execution.json`, `.sdd/.executions/`, intentos y recibos por fase) y el reporte de costo al final (`/zero-cost`).
   - La validación de `spec.md` (bloques `### REQ:` con `Acceptance criteria`) y el chequeo del total de `## Review Workload`: forge sólo valida la estructura de las tareas.
-  - El algoritmo de reanudación por artefactos (`/forge --continue` que detecta en qué fase quedó un run viejo) y la pregunta ante un slug existente: forge siempre arranca un slug nuevo y `continue` sólo retoma el run de la sesión, adopta un handoff de NODD o retoma desde explore un run adoptado que se cortó antes de `spec.md`.
+  - El algoritmo de reanudación por artefactos (`/forge --continue` que detecta en qué fase quedó un run viejo) y la pregunta ante un slug existente: forge siempre arranca un slug nuevo y `continue` sólo retoma un run que forge dejó cortado o parado (en memoria o en su `run.json`), adopta un handoff de NODD o retoma desde explore un run adoptado que se cortó antes de `spec.md`.
   - La memoria del run en Cortex, las métricas en `~/.pi/zero-runs.jsonl`, el archivado de specs (`spec-merge`) y los comandos de git/PR/issue.
   - El `cap` de `.sdd/config.json` (`rounds.cap`): forge usa el suyo.
 - zero-pi no deja saltear clarify ni analyze; forge sí, a pedido (`/forge phase … off`). Por defecto corren las seis.
