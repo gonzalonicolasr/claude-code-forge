@@ -1,6 +1,7 @@
 import { expect, test, describe, mock } from 'claude-code/testing'
-import { otherRuns, staleRunKeys, statePath, zeroTarget, aliasOf, editZeroProfile, profileName, builtinModified, routeFor, phaseOfAgentType, parseVerdict, advance, slugify, parseStart, modelCatalog, groupOf, cleanMessages, thinkingByTool, stateSnapshot, exportStatus, DEFAULT_PROFILES, DEFAULT_EFFORTS, BUILTIN_PROFILES, cpamModel, claudeEffort, compareModels, zeroProfiles, isExcluded, effortBlocked, groupLabel, PHASES, phaseOrder, parseDecision, parseClarifyStatus, pickAnswer, forgeMayRun, modelUnavailable, section, parseTasks, validateTasks, buildBatches, nextWave, planUnits, normalizePath, samePath, tickTasks, waveEvidence, waveEnvelope, PARALLEL_MAX, parseSize, isNoddHandoff, noddHandoffProblem, parseContinue, adoptedRunResumable } from './logic.ts'
+import { otherRuns, staleRunKeys, statePath, zeroTarget, aliasOf, editZeroProfile, profileName, builtinModified, routeFor, phaseOfAgentType, parseVerdict, advance, slugify, parseStart, modelCatalog, groupOf, cleanMessages, thinkingByTool, stateSnapshot, exportStatus, DEFAULT_PROFILES, DEFAULT_EFFORTS, BUILTIN_PROFILES, cpamModel, claudeEffort, compareModels, zeroProfiles, isExcluded, effortBlocked, groupLabel, PHASES, phaseOrder, parseDecision, parseClarifyStatus, pickAnswer, forgeMayRun, modelUnavailable, section, parseTasks, validateTasks, buildBatches, nextWave, planUnits, normalizePath, samePath, tickTasks, waveEvidence, waveEnvelope, PARALLEL_MAX, parseSize, isNoddHandoff, noddHandoffProblem, parseContinue, adoptedRunResumable, normalizeRun } from './logic.ts'
 import { PHASE_PROMPTS, finalInstruction, NODD_HINT, briefFor } from './prompts.ts'
+import { VERSION } from './register.ts'
 
 describe('ruteo', () => {
   test('los tipos forge:<fase> se reconocen y el resto no', () => {
@@ -900,6 +901,22 @@ describe('directorio del run (hooks)', () => {
     expect(await forge($, 'continue --dir ~/projects/ascii-rpg fps')).toBe(`sigo fps desde explore (recuperado de ${dir}/run.json)`)
   })
 
+  test('continue --dir de otro proyecto no retoma el run en memoria', async ($, on) => {
+    const w = await world($, on, '/a', {}, ['/a', '/b'])
+    expect(await forge($, '--auto uno')).toContain('run uno')
+    expect(await forge($, 'stop')).toBe('run uno parado')
+    expect(await forge($, 'continue --dir /b')).toBe('no hay un run parado para seguir')
+    expect(JSON.parse(w.files['/a/.sdd/uno/run.json']!).status).toBe('parado')
+  })
+
+  test('continue --dir del mismo proyecto sí retoma el run en memoria', async ($, on) => {
+    const w = await world($, on, '/a', {}, ['/a'])
+    expect(await forge($, '--auto uno')).toContain('run uno')
+    expect(await forge($, 'stop')).toBe('run uno parado')
+    expect(await forge($, 'continue --dir /a')).toBe('sigo uno desde clarify')
+    expect(JSON.parse(w.files['/a/.sdd/uno/run.json']!).status).toBe('running')
+  })
+
   test('el worktree avisa con el repo principal', async ($, on) => {
     await world($, on, '/w/wt', { '/w/wt': { exitCode: 0, stdout: '/w/wt\n/w/main/.git/worktrees/wt\n/w/main/.git\n' } })
     expect(await forge($, '--auto cuatro')).toContain('⚠ el run usa /w/wt, un worktree de git (/w/wt) y no el repo principal /w/main: si querías el principal, /forge stop y /forge --dir /w/main <pedido>')
@@ -918,6 +935,19 @@ describe('arranque', () => {
     expect(parseStart('--auto --cap 2 agregá suma')).toEqual({ request: 'agregá suma', mode: 'automatic', cap: 2 })
     expect(parseStart('--interactive --profile calidad hacé X')).toEqual({ request: 'hacé X', mode: 'interactive', profile: 'calidad' })
     expect(parseStart('--auto --dir /w/repo hacé X')).toEqual({ request: 'hacé X', mode: 'automatic', dir: '/w/repo' })
+  })
+
+  test('las banderas mal formadas devuelven un error en vez de consumir el pedido', () => {
+    const cap = 'cap inválido: usá --cap N con N entre 1 y 9'
+    expect(parseStart('--cap abc hola').error).toBe(cap)
+    expect(parseStart('--cap 0').error).toBe(cap)
+    expect(parseStart('--cap 12').error).toBe(cap)
+    expect(parseStart('--profile').error).toBe('falta el valor de --profile')
+    expect(parseStart('--profile --auto').error).toBe('falta el valor de --profile')
+    expect(parseStart('--dir').error).toBe('falta el valor de --dir')
+    expect(parseStart('--dir --auto pedido').error).toBe('falta el valor de --dir')
+    expect(parseStart('--cap 9').cap).toBe(9)
+    expect(parseStart('--dir /w/repo hacé X').dir).toBe('/w/repo')
   })
 })
 
@@ -1687,5 +1717,797 @@ describe('un run por sesión (hooks)', () => {
     await open('B')
     expect(await forge($, 'config reset')).toBe('esta sesión vuelve a la config default (perfil turbo)')
     expect(store['config:B']).toBe(undefined)
+  })
+})
+
+describe('dispatch retardado (hooks)', () => {
+  async function world($: any, on: any) {
+    mock.env(on, { HOME: '/h' })
+    mock.store(on)
+    const clock = mock.clock(on)
+    const files: Record<string, string> = {}
+    const submitted: string[] = []
+    on('fs.read', async (_$: any, e: any) => ({ value: files[e.path] ?? '' }))
+    on('fs.write', async (_$: any, e: any) => {
+      files[e.path] = e.text
+      return { value: undefined }
+    })
+    on('fs.list', async () => ({ value: [] }))
+    on('fs.stat', async () => ({ deny: 'no existe' }))
+    on('process.run', async () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+    on('command.list', async () => ({ value: [] }))
+    on('ui.log', async () => ({ value: undefined }))
+    on('session.cwd', async () => ({ value: '/w' }))
+    on('session.id', async () => ({ value: 'sesion' }))
+    on('prompt.submit', async (_$: any, e: any) => {
+      submitted.push(e.text)
+      return { drop: '' }
+    })
+    return { clock, files, submitted }
+  }
+
+  test('start → /forge stop → advance(30) no vuelve a mandar la instrucción', async ($, on) => {
+    const w = await world($, on)
+    const start: any = await $.command.run({ command: 'forge', args: '--auto suma' })
+    expect(String(start.text).startsWith('run suma')).toBe(true)
+    const stop: any = await $.command.run({ command: 'forge', args: 'stop' })
+    expect(stop.text).toBe('run suma parado')
+    await w.clock.advance(30)
+    expect(w.submitted).toEqual([])
+    expect(JSON.parse(w.files['/w/.sdd/suma/run.json']!).status).toBe('parado')
+  })
+
+  test('un timer viejo no dispara después de parar y arrancar otro run', async ($, on) => {
+    const w = await world($, on)
+    await $.command.run({ command: 'forge', args: '--auto uno' })
+    await $.command.run({ command: 'forge', args: 'stop' })
+    await $.command.run({ command: 'forge', args: '--auto dos' })
+    await w.clock.advance(30)
+    expect(w.submitted).toHaveLength(1)
+    expect(w.submitted[0]).toContain('Run `dos` is ready')
+  })
+})
+
+describe('headless pasa parallelCount (hooks)', () => {
+  const stat = { status: 'pending', model: 'm', effort: 'auto', answeredBy: '', ms: 0, startedAt: 0, inTok: 0, outTok: 0, steps: 0 }
+  const TASKS = [
+    ['T001', ''],
+    ['T002', ' [P]'],
+    ['T003', ' [P]'],
+    ['T004', ' [P]'],
+    ['T005', ''],
+  ]
+    .map(([id, p]) => [`- [ ] ${id} — tarea${p}`, `  - files: \`src/${id}.ts\``, `  - depends: [${id === 'T005' ? 'T002, T003, T004' : ''}]`, '  - evidence: `bun test` passes', '  - review: ~50 changed lines'].join('\n'))
+    .join('\n')
+
+  const seedRun = (over: any = {}) =>
+    JSON.stringify({
+      slug: 'fps', dir: '/w/.sdd/fps', cwd: '/w', request: 'fps', mode: 'automatic', cap: 3, verdicts: [], expected: 'build', status: 'parado',
+      order: ['explore', 'plan', 'build', 'veredicto'], startedAt: 1, endedAt: 2, stats: Object.fromEntries(PHASES.map((p) => [p, stat])), decisions: [], clarified: true,
+      tdd: 'strict', unitIdx: 1, delivered: ['T001'], retryAlone: [], flights: {}, retried: false, note: 'x', awaitTurn: false, asyncSeen: false, ...over,
+    })
+
+  async function world($: any, on: any, seed: Record<string, string>) {
+    mock.env(on, { HOME: '/h', CLAUDE_CODE_ENTRYPOINT: 'sdk-cli' })
+    mock.store(on)
+    const clock = mock.clock(on)
+    const files: Record<string, string> = { ...seed }
+    const submitted: string[] = []
+    on('fs.read', async (_$: any, e: any) => ({ value: files[e.path] ?? '' }))
+    on('fs.write', async (_$: any, e: any) => {
+      files[e.path] = e.text
+      return { value: undefined }
+    })
+    on('fs.list', async () => ({ value: [] }))
+    on('fs.stat', async () => ({ deny: 'no existe' }))
+    on('process.run', async () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+    on('command.list', async () => ({ value: [] }))
+    on('ui.log', async () => ({ value: undefined }))
+    on('session.cwd', async () => ({ value: '/w' }))
+    on('session.id', async () => ({ value: 'sesion' }))
+    on('session.start', async (_$: any, e: any) => ({ cwd: e.cwd }))
+    on('prompt.submit', async (_$: any, e: any) => {
+      submitted.push(e.text)
+      return { drop: '' }
+    })
+    return { clock, files, submitted }
+  }
+
+  test('continue headless de un run parado en build pasa el N de la tanda', async ($, on) => {
+    const w = await world($, on, { '/w/.sdd/fps/run.json': seedRun(), '/w/.sdd/fps/tasks.md': TASKS })
+    await $.session.start({ cwd: '/w', surface: null, isInteractive: false } as any)
+    await $.prompt.submit({ text: '/forge continue fps' } as any)
+    expect(w.submitted).toHaveLength(1)
+    expect(w.submitted[0]).toContain('make 3 Agent tool calls IN ONE SINGLE MESSAGE')
+    expect(w.submitted[0]).toContain('subagent_type "forge:build"')
+  })
+
+  test('continue headless de un run cortado a mitad de tanda pasa el N de la tanda', async ($, on) => {
+    const mid = seedRun({ status: 'cortado', unit: { index: 1, total: 3, tasks: ['T002', 'T003', 'T004'], parallel: true, whole: false, claimed: ['T002'], results: {} } })
+    const w = await world($, on, { '/w/.sdd/fps/run.json': mid, '/w/.sdd/fps/tasks.md': TASKS })
+    await $.session.start({ cwd: '/w', surface: null, isInteractive: false } as any)
+    await $.prompt.submit({ text: '/forge continue fps' } as any)
+    expect(w.submitted).toHaveLength(1)
+    expect(w.submitted[0]).toContain('make 3 Agent tool calls IN ONE SINGLE MESSAGE')
+  })
+})
+
+describe('normalizeRun', () => {
+  const phase = (status = 'pending') => ({ status, model: 'm', effort: 'auto', answeredBy: '', ms: 0, startedAt: 0, inTok: 0, outTok: 0, steps: 0 })
+  const base = () => ({
+    slug: 's', dir: '/w/.sdd/s', cwd: '/w', request: 'pedido', mode: 'automatic', cap: 3, verdicts: [], expected: 'clarify', status: 'running',
+    order: [...PHASES], startedAt: 1, stats: Object.fromEntries(PHASES.map((p) => [p, phase()])), decisions: [], clarified: false, tdd: 'strict',
+    unitIdx: 0, delivered: [], retryAlone: [], flights: {}, retried: false, note: '', routing: [], awaitTurn: false, asyncSeen: false,
+  })
+
+  test('acepta un run válido, conserva campos desconocidos y convierte expected vacío', () => {
+    const out: any = normalizeRun({ ...base(), extra: { x: 1 }, expected: '' })
+    expect(out).toBeDefined()
+    expect(out.slug).toBe('s')
+    expect(out.extra).toEqual({ x: 1 })
+    expect(out.expected).toBe(undefined)
+    expect(out.cap).toBe(3)
+    expect(out.awaitTurn).toBe(true)
+  })
+
+  test('rechaza expected fuera de order, fase desconocida y tipos rotos', () => {
+    expect(normalizeRun({ ...base(), expected: 'analyze', order: ['explore', 'plan', 'build', 'veredicto'] })).toBe(undefined)
+    expect(normalizeRun({ ...base(), order: ['explore', 'rara'] })).toBe(undefined)
+    expect(normalizeRun({ ...base(), slug: 3 })).toBe(undefined)
+    expect(normalizeRun({ ...base(), order: [] })).toBe(undefined)
+    expect(normalizeRun(undefined)).toBe(undefined)
+  })
+
+  test('rellena stats por fase y los arrays y cap que faltan', () => {
+    const { stats: _s, verdicts: _v, decisions: _d, routing: _r, cap: _c, ...saved } = base()
+    const out: any = normalizeRun(saved)
+    expect(Object.keys(out.stats)).toEqual([...PHASES])
+    expect(out.stats.clarify.status).toBe('pending')
+    expect(out.verdicts).toEqual([])
+    expect(out.decisions).toEqual([])
+    expect(out.routing).toEqual([])
+    expect(out.cap).toBe(3)
+    expect(normalizeRun({ ...base(), cap: 42 })!.cap).toBe(3)
+  })
+})
+
+describe('run.json corrupto no tira (hooks)', () => {
+  const stat = { status: 'pending', model: 'm', effort: 'auto', answeredBy: '', ms: 0, startedAt: 0, inTok: 0, outTok: 0, steps: 0 }
+  const DIR = '/w/.sdd/malo'
+  const forge = async ($: any, args: string) => String(((await $.command.run({ command: 'forge', args })) as any).text)
+
+  async function world($: any, on: any, runJson: string) {
+    mock.env(on, { HOME: '/h' })
+    const store: Record<string, unknown> = { 'run:sesion': { dir: DIR, slug: 'malo', cwd: '/w', status: 'running', at: 1 } }
+    on('store.get', async (_$: any, e: any) => ({ value: store[e.key] === undefined ? undefined : JSON.parse(JSON.stringify(store[e.key])) }))
+    on('store.set', async (_$: any, e: any) => {
+      store[e.key] = JSON.parse(JSON.stringify(e.value))
+      return { value: undefined }
+    })
+    on('store.delete', async (_$: any, e: any) => {
+      delete store[e.key]
+      return { value: undefined }
+    })
+    on('store.keys', async () => ({ value: Object.keys(store) }))
+    mock.clock(on)
+    const files: Record<string, string> = { [`${DIR}/run.json`]: runJson }
+    on('fs.read', async (_$: any, e: any) => ({ value: files[e.path] ?? '' }))
+    on('fs.write', async (_$: any, e: any) => {
+      files[e.path] = e.text
+      return { value: undefined }
+    })
+    on('fs.list', async () => ({ value: [] }))
+    on('fs.stat', async () => ({ deny: 'no existe' }))
+    on('process.run', async () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+    on('command.list', async () => ({ value: [] }))
+    on('ui.log', async () => ({ value: undefined }))
+    on('session.cwd', async () => ({ value: '/w' }))
+    on('session.id', async () => ({ value: 'sesion' }))
+    on('session.start', async (_$: any, e: any) => ({ cwd: e.cwd }))
+    return { files, store }
+  }
+
+  test('session.start y status no tiran con run.json sin stats y lo hidratan con defaults', async ($, on) => {
+    const w = await world($, on, JSON.stringify({
+      slug: 'malo', dir: DIR, cwd: '/w', request: 'x', mode: 'automatic', cap: 3, verdicts: [], expected: 'explore', status: 'running',
+      order: ['explore', 'plan', 'build', 'veredicto'], startedAt: 1, decisions: [], clarified: true, tdd: 'strict', unitIdx: 0, delivered: [],
+      retryAlone: [], flights: {}, retried: false, note: '', awaitTurn: false, asyncSeen: false, owner: 'sesion',
+    }))
+    await $.session.start({ cwd: '/w', surface: null, isInteractive: false } as any)
+    expect(await forge($, 'status')).toContain('run malo · CORRIENDO')
+    expect(JSON.parse(w.files['/h/.local/state/forge/state-sesion.json']!).run.slug).toBe('malo')
+  })
+
+  test('run.json con expected fuera de order se ignora sin tirar', async ($, on) => {
+    await world($, on, JSON.stringify({
+      slug: 'malo', dir: DIR, cwd: '/w', request: 'x', mode: 'automatic', cap: 3, verdicts: [], expected: 'clarify', status: 'running',
+      order: ['explore', 'plan', 'build', 'veredicto'], startedAt: 1, stats: Object.fromEntries(PHASES.map((p) => [p, stat])), decisions: [],
+      clarified: true, tdd: 'strict', unitIdx: 0, delivered: [], retryAlone: [], flights: {}, retried: false, note: '', awaitTurn: false, asyncSeen: false, owner: 'sesion',
+    }))
+    await $.session.start({ cwd: '/w', surface: null, isInteractive: false } as any)
+    expect(await forge($, 'status')).toContain('sin runs en esta sesión')
+  })
+
+  test('run.json con fase desconocida y tipos rotos no tira', async ($, on) => {
+    await world($, on, JSON.stringify({ slug: 'malo', dir: DIR, cwd: '/w', request: 'x', status: 'running', order: ['rara'], owner: 'sesion' }))
+    await $.session.start({ cwd: '/w', surface: null, isInteractive: false } as any)
+    expect(await forge($, 'status')).toContain('sin runs en esta sesión')
+  })
+})
+
+describe('turno adoptado al hidratar (hooks)', () => {
+  const stat = { status: 'pending', model: 'm', effort: 'auto', answeredBy: '', ms: 0, startedAt: 0, inTok: 0, outTok: 0, steps: 0 }
+  const DIR = '/w/.sdd/malo'
+  const runningRun = (over: any = {}) =>
+    JSON.stringify({
+      slug: 'malo', dir: DIR, cwd: '/w', request: 'x', mode: 'automatic', cap: 3, verdicts: [], expected: 'explore', status: 'running',
+      order: ['explore', 'plan', 'build', 'veredicto'], startedAt: 1, stats: Object.fromEntries(PHASES.map((p) => [p, stat])), decisions: [], clarified: true,
+      tdd: 'strict', unitIdx: 0, delivered: [], retryAlone: [], flights: {}, retried: false, note: '', awaitTurn: false, asyncSeen: false, owner: 'sesion', ...over,
+    })
+
+  async function world($: any, on: any, runJson: string) {
+    mock.env(on, { HOME: '/h' })
+    const store: Record<string, unknown> = { 'run:sesion': { dir: DIR, slug: 'malo', cwd: '/w', status: 'running', at: 1 } }
+    on('store.get', async (_$: any, e: any) => ({ value: store[e.key] === undefined ? undefined : JSON.parse(JSON.stringify(store[e.key])) }))
+    on('store.set', async (_$: any, e: any) => {
+      store[e.key] = JSON.parse(JSON.stringify(e.value))
+      return { value: undefined }
+    })
+    on('store.delete', async (_$: any, e: any) => {
+      delete store[e.key]
+      return { value: undefined }
+    })
+    on('store.keys', async () => ({ value: Object.keys(store) }))
+    mock.clock(on)
+    const files: Record<string, string> = { [`${DIR}/run.json`]: runJson }
+    on('fs.read', async (_$: any, e: any) => ({ value: files[e.path] ?? '' }))
+    on('fs.write', async (_$: any, e: any) => {
+      files[e.path] = e.text
+      return { value: undefined }
+    })
+    on('fs.list', async () => ({ value: [] }))
+    on('fs.stat', async () => ({ deny: 'no existe' }))
+    on('process.run', async () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+    on('command.list', async () => ({ value: [] }))
+    on('ui.log', async () => ({ value: undefined }))
+    on('session.cwd', async () => ({ value: '/w' }))
+    on('session.id', async () => ({ value: 'sesion' }))
+    on('session.start', async (_$: any, e: any) => ({ cwd: e.cwd }))
+    on('turn.start', async (_$: any, e: any) => ({ turnId: e.turnId }))
+    on('turn.complete', async (_$: any, e: any) => ({ text: e.answer }))
+    return { files }
+  }
+
+  test('un run hidratado con awaitTurn:false adopta el turno y queda cortado si el turno muere', async ($, on) => {
+    const w = await world($, on, runningRun())
+    await $.session.start({ cwd: '/w', surface: null, isInteractive: false } as any)
+    await $.turn.start({ turnId: 'main', text: 'x' } as any)
+    await $.turn.complete({ turnId: 'main', reason: 'error', answer: 'API Error: 401', durationMs: 1, isAborted: false } as any)
+    const saved = JSON.parse(w.files[`${DIR}/run.json`]!)
+    expect(saved.status).toBe('cortado')
+    expect(saved.note).toContain('el turno principal se cortó')
+  })
+
+  test('un run hidratado no queda cortado por un turn.complete con turnId viejo', async ($, on) => {
+    const w = await world($, on, runningRun({ turnId: 'viejo' }))
+    await $.session.start({ cwd: '/w', surface: null, isInteractive: false } as any)
+    await $.turn.complete({ turnId: 'viejo', reason: 'error', answer: 'API Error: 401', durationMs: 1, isAborted: false } as any)
+    expect(JSON.parse(w.files[`${DIR}/run.json`]!).status).toBe('running')
+  })
+})
+
+describe('persist serializado (hooks)', () => {
+  const DIR = '/w/.sdd/uno'
+  const settle = async () => {
+    for (let i = 0; i < 50; i++) await new Promise<void>((r) => setTimeout(r, 0))
+  }
+  const until = async (fn: () => boolean) => {
+    for (let i = 0; i < 100 && !fn(); i++) await new Promise<void>((r) => setTimeout(r, 0))
+  }
+
+  async function world($: any, on: any) {
+    mock.env(on, { HOME: '/h' })
+    mock.store(on)
+    mock.clock(on)
+    const files: Record<string, string> = {}
+    let hold = false
+    let release: () => void = () => {}
+    let gate: Promise<void> = Promise.resolve()
+    let runJsonWrites = 0
+    on('fs.read', async (_$: any, e: any) => ({ value: files[e.path] ?? '' }))
+    on('fs.write', async (_$: any, e: any) => {
+      if (e.path.endsWith('/run.json')) {
+        runJsonWrites++
+        if (hold) await gate
+      }
+      files[e.path] = e.text
+      return { value: undefined }
+    })
+    on('fs.list', async () => ({ value: [] }))
+    on('fs.stat', async () => ({ deny: 'no existe' }))
+    on('process.run', async () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+    on('command.list', async () => ({ value: [] }))
+    on('ui.log', async () => ({ value: undefined }))
+    on('session.cwd', async () => ({ value: '/w' }))
+    on('session.id', async () => ({ value: 'sesion' }))
+    on('prompt.submit', async () => ({ drop: '' }))
+    return {
+      files,
+      runJsonWrites: () => runJsonWrites,
+      arm: () => {
+        runJsonWrites = 0
+        hold = true
+        gate = new Promise<void>((r) => (release = r))
+      },
+      release: () => {
+        hold = false
+        release()
+      },
+      settle,
+      until,
+    }
+  }
+
+  test('una escritura retardada deja run.json terminal y routing.log completo', async ($, on) => {
+    const w = await world($, on)
+    w.arm()
+    const start = $.command.run({ command: 'forge', args: '--auto uno' })
+    await w.until(() => w.runJsonWrites() >= 1)
+    const stop = $.command.run({ command: 'forge', args: 'stop' })
+    await w.settle()
+    await w.settle()
+    w.release()
+    await Promise.all([start, stop])
+    expect(JSON.parse(w.files[`${DIR}/run.json`]!).status).toBe('parado')
+    const lines = w.files[`${DIR}/routing.log`]!.split('\n').filter(Boolean)
+    expect(lines.some((l) => l.includes('run uno'))).toBe(true)
+    expect(lines.some((l) => l.includes('parado:'))).toBe(true)
+  })
+
+  test('varias persistencias concurrentes coalescen en una sola escritura extra', async ($, on) => {
+    const w = await world($, on)
+    w.arm()
+    const start = $.command.run({ command: 'forge', args: '--auto uno' })
+    await w.until(() => w.runJsonWrites() >= 1)
+    const stop = $.command.run({ command: 'forge', args: 'stop' })
+    await w.settle()
+    const cont = $.command.run({ command: 'forge', args: 'continue' })
+    await w.settle()
+    w.release()
+    await Promise.all([start, stop, cont])
+    expect(w.runJsonWrites()).toBe(2)
+    expect(JSON.parse(w.files[`${DIR}/run.json`]!).status).toBe('running')
+    const lines = w.files[`${DIR}/routing.log`]!.split('\n').filter(Boolean)
+    expect(lines.some((l) => l.includes('parado:'))).toBe(true)
+  })
+})
+
+describe('cap bounds (hooks)', () => {
+  const forge = async ($: any, args: string) => String(((await $.command.run({ command: 'forge', args })) as any).text)
+
+  async function rejectWorld($: any, on: any) {
+    mock.env(on, { HOME: '/h' })
+    mock.store(on)
+    mock.clock(on)
+    const files: Record<string, string> = {}
+    on('fs.read', async (_$: any, e: any) => ({ value: files[e.path] ?? '' }))
+    on('fs.write', async (_$: any, e: any) => {
+      files[e.path] = e.text
+      return { value: undefined }
+    })
+    on('fs.list', async () => ({ value: [] }))
+    on('fs.stat', async () => ({ deny: 'no existe' }))
+    on('process.run', async () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+    on('command.list', async () => ({ value: [] }))
+    on('ui.log', async () => ({ value: undefined }))
+    on('session.cwd', async () => ({ value: '/w' }))
+    on('session.id', async () => ({ value: 'sesion' }))
+    on('prompt.submit', async () => ({ drop: '' }))
+  }
+
+  test('un cap o bandera mal formados se rechazan sin arrancar el run', async ($, on) => {
+    await rejectWorld($, on)
+    const cap = 'cap inválido: usá --cap N con N entre 1 y 9'
+    expect(await forge($, '--cap abc hola')).toBe(cap)
+    expect(await forge($, '--cap 0 hola')).toBe(cap)
+    expect(await forge($, '--cap 12 hola')).toBe(cap)
+    expect(await forge($, '--profile')).toBe('falta el valor de --profile')
+    expect(await forge($, '--dir --auto hola')).toBe('falta el valor de --dir')
+  })
+
+  test('una config guardada con cap inválido arranca en 3', async ($, on) => {
+    const store: Record<string, unknown> = { config: { mode: 'automatic', cap: 0, profile: 'barato', models: DEFAULT_PROFILES.barato, efforts: DEFAULT_EFFORTS.barato, skip: [] } }
+    mock.env(on, { HOME: '/h' })
+    on('store.get', async (_$: any, e: any) => ({ value: store[e.key] === undefined ? undefined : JSON.parse(JSON.stringify(store[e.key])) }))
+    on('store.set', async (_$: any, e: any) => {
+      store[e.key] = JSON.parse(JSON.stringify(e.value))
+      return { value: undefined }
+    })
+    on('store.delete', async (_$: any, e: any) => {
+      delete store[e.key]
+      return { value: undefined }
+    })
+    on('store.keys', async () => ({ value: Object.keys(store) }))
+    mock.clock(on)
+    const files: Record<string, string> = {}
+    on('fs.read', async (_$: any, e: any) => ({ value: files[e.path] ?? '' }))
+    on('fs.write', async (_$: any, e: any) => {
+      files[e.path] = e.text
+      return { value: undefined }
+    })
+    on('fs.list', async () => ({ value: [] }))
+    on('fs.stat', async () => ({ deny: 'no existe' }))
+    on('process.run', async () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+    on('command.list', async () => ({ value: [] }))
+    on('ui.log', async () => ({ value: undefined }))
+    on('session.cwd', async () => ({ value: '/w' }))
+    on('session.id', async () => ({ value: 'sesion' }))
+    on('session.start', async (_$: any, e: any) => ({ cwd: e.cwd }))
+    await $.session.start({ cwd: '/w', surface: null, isInteractive: false } as any)
+    expect(await forge($, 'status')).toContain('cap 3')
+    store.config = { mode: 'automatic', cap: 42, profile: 'barato', models: DEFAULT_PROFILES.barato, efforts: DEFAULT_EFFORTS.barato, skip: [] }
+    await $.session.start({ cwd: '/w', surface: null, isInteractive: false } as any)
+    expect(await forge($, 'status')).toContain('cap 3')
+    store.config = { mode: 'automatic', cap: 'x', profile: 'barato', models: DEFAULT_PROFILES.barato, efforts: DEFAULT_EFFORTS.barato, skip: [] }
+    await $.session.start({ cwd: '/w', surface: null, isInteractive: false } as any)
+    expect(await forge($, 'status')).toContain('cap 3')
+  })
+})
+
+describe('cpam usage (hooks)', () => {
+  const DIR = '/w/.sdd/suma'
+  const until = async (fn: () => boolean) => {
+    for (let i = 0; i < 100 && !fn(); i++) await new Promise<void>((r) => setTimeout(r, 0))
+  }
+
+  async function world($: any, on: any, usage: Record<string, number> = { input_tokens: 1, output_tokens: 2, cache_read_input_tokens: 3, cache_creation_input_tokens: 4 }) {
+    mock.env(on, { HOME: '/h' })
+    mock.store(on)
+    mock.clock(on)
+    const files: Record<string, string> = {}
+    on('fs.read', async (_$: any, e: any) => ({ value: files[e.path] ?? '' }))
+    on('fs.write', async (_$: any, e: any) => {
+      files[e.path] = e.text
+      return { value: undefined }
+    })
+    on('fs.list', async () => ({ value: [] }))
+    on('fs.stat', async () => ({ deny: 'no existe' }))
+    on('process.run', async (_$: any, e: any) => {
+      if (Array.isArray(e.argv) && e.argv[0] === 'bash') {
+        const data = {
+          content: [{ type: 'text', text: 'respuesta del CPAM' }],
+          usage,
+          stop_reason: 'end_turn',
+          model: 'ag3/gemini-3.7-flash-high',
+        }
+        return { value: { exitCode: 0, stdout: `${JSON.stringify(data)}\n200`, stderr: '' } }
+      }
+      return { value: { exitCode: 0, stdout: '', stderr: '' } }
+    })
+    on('command.list', async () => ({ value: [] }))
+    on('ui.log', async () => ({ value: undefined }))
+    on('session.cwd', async () => ({ value: '/w' }))
+    on('session.id', async () => ({ value: 'sesion' }))
+    on('session.messages', async () => ({ value: [{ role: 'user', content: 'hola' }] }))
+    on('agent.list', async () => ({ value: [{ id: 'forge:clarify', type: 'forge:clarify' }] }))
+    on('prompt.submit', async () => ({ drop: '' }))
+    return { files, until }
+  }
+
+  test('los tokens de cache-creation del CPAM se suman al stats de la fase', async ($, on) => {
+    const w = await world($, on)
+    const start: any = await $.command.run({ command: 'forge', args: '--auto suma' })
+    expect(String(start.text).startsWith('run suma')).toBe(true)
+    const stream = $.turn.step({ agentId: 'forge:clarify', index: 0, turnId: 't0', model: 'ag3/gemini-3.7-flash-high', messageCount: 1 } as any)
+    for await (const _ of stream) void _
+    await w.until(() => {
+      const saved = w.files[`${DIR}/run.json`]
+      if (!saved) return false
+      const s = JSON.parse(saved).stats?.clarify
+      return !!s && s.steps > 0 && s.inTok > 0
+    })
+    const saved = JSON.parse(w.files[`${DIR}/run.json`]!)
+    expect(saved.stats.clarify.inTok).toBe(1 + 3 + 4)
+    expect(saved.stats.clarify.outTok).toBe(2)
+  })
+
+  test('con otros números de uso el cache-creation también entra en inTok y en el log', async ($, on) => {
+    const w = await world($, on, { input_tokens: 10, output_tokens: 20, cache_read_input_tokens: 30, cache_creation_input_tokens: 40 })
+    const start: any = await $.command.run({ command: 'forge', args: '--auto suma' })
+    expect(String(start.text).startsWith('run suma')).toBe(true)
+    const stream = $.turn.step({ agentId: 'forge:clarify', index: 0, turnId: 't0', model: 'ag3/gemini-3.7-flash-high', messageCount: 1 } as any)
+    for await (const _ of stream) void _
+    await w.until(() => {
+      const saved = w.files[`${DIR}/run.json`]
+      if (!saved) return false
+      const s = JSON.parse(saved).stats?.clarify
+      return !!s && s.steps > 0 && s.inTok > 0
+    })
+    const saved = JSON.parse(w.files[`${DIR}/run.json`]!)
+    expect(saved.stats.clarify.inTok).toBe(10 + 30 + 40)
+    expect(w.files[`${DIR}/routing.log`]).toContain('cache=70')
+  })
+})
+
+describe('cachés e inbox (hooks)', () => {
+  const INBOX = '/h/.local/state/forge/inbox-sesion.json'
+  const forge = async ($: any, args: string) => String(((await $.command.run({ command: 'forge', args })) as any).text)
+
+  async function world($: any, on: any, seed: Record<string, string> = {}, failInboxWrite = false) {
+    mock.env(on, { HOME: '/h' })
+    mock.store(on)
+    const clock = mock.clock(on)
+    const files: Record<string, string> = { ...seed }
+    let inboxWrites = 0
+    on('fs.read', async (_$: any, e: any) => ({ value: files[e.path] ?? '' }))
+    on('fs.write', async (_$: any, e: any) => {
+      if (e.path === INBOX) inboxWrites++
+      if (failInboxWrite && e.path === INBOX) return { deny: 'no se pudo escribir' }
+      files[e.path] = e.text
+      return { value: undefined }
+    })
+    on('fs.list', async () => ({ value: [] }))
+    on('fs.stat', async (_$: any, e: any) => (e.path in files ? { value: { kind: 'file', size: files[e.path]!.length, mtimeMs: 1 } } : { deny: 'no existe' }))
+    on('process.run', async () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+    on('command.list', async () => ({ value: [] }))
+    on('ui.log', async () => ({ value: undefined }))
+    on('session.cwd', async () => ({ value: '/w' }))
+    on('session.id', async () => ({ value: 'sesion' }))
+    on('session.start', async (_$: any, e: any) => ({ cwd: e.cwd }))
+    on('turn.complete', async (_$: any, e: any) => ({ text: e.answer }))
+    on('prompt.submit', async () => ({ drop: '' }))
+    return { clock, files, inboxWrites: () => inboxWrites }
+  }
+
+  test('los mapas por-run no guardan entradas del run anterior al arrancar otro', async ($, on) => {
+    const w = await world($, on)
+    on('agent.list', async () => ({ value: [{ id: 'forge:clarify', type: 'forge:clarify' }] }))
+    expect(await forge($, '--auto uno')).toContain('run uno')
+    await $.turn.complete({ agentId: 'forge:clarify', answer: 'x', turnId: 't', durationMs: 1, isAborted: false } as any)
+    expect(await forge($, 'stop')).toBe('run uno parado')
+    const afterStop = JSON.parse(w.files['/h/.local/state/forge/state-sesion.json']!).debugSizes
+    expect([afterStop.thinking, afterStop.cpamCalls, afterStop.answers, afterStop.autoAgents]).toEqual([0, 0, 0, 0])
+    expect(await forge($, '--auto dos')).toContain('run dos')
+    const afterStart = JSON.parse(w.files['/h/.local/state/forge/state-sesion.json']!).debugSizes
+    expect([afterStart.thinking, afterStart.cpamCalls, afterStart.answers, afterStart.autoAgents]).toEqual([0, 0, 0, 0])
+  })
+
+  test('un mensaje viejo del inbox queda acuseado y no se reprocesa', async ($, on) => {
+    const w = await world($, on, { [INBOX]: JSON.stringify({ id: 'm1', at: 0, args: 'status' }) })
+    await $.session.start({ cwd: '/w', surface: null, isInteractive: false } as any)
+    await w.clock.advance(360)
+    await w.clock.advance(360)
+    await w.clock.advance(360)
+    expect(JSON.parse(w.files[INBOX]!).done).toBe(true)
+  })
+
+  test('si no se puede escribir el acuse, el mensaje no se reprocesa en el siguiente poll', async ($, on) => {
+    const w = await world($, on, { [INBOX]: JSON.stringify({ id: 'm2', at: Date.now(), args: 'status' }) }, true)
+    await $.session.start({ cwd: '/w', surface: null, isInteractive: false } as any)
+    await w.clock.advance(360)
+    expect(w.inboxWrites()).toBe(1)
+    await w.clock.advance(360)
+    await w.clock.advance(360)
+    expect(w.inboxWrites()).toBe(1)
+  })
+})
+
+describe('catálogo memoizado (hooks)', () => {
+  const forge = async ($: any, args: string) => String(((await $.command.run({ command: 'forge', args })) as any).text)
+
+  async function world($: any, on: any) {
+    mock.env(on, { HOME: '/h' })
+    mock.store(on)
+    mock.clock(on)
+    const files: Record<string, string> = {}
+    on('fs.read', async (_$: any, e: any) => ({ value: files[e.path] ?? '' }))
+    on('fs.write', async (_$: any, e: any) => {
+      files[e.path] = e.text
+      return { value: undefined }
+    })
+    on('fs.list', async () => ({ value: [] }))
+    on('fs.stat', async () => ({ deny: 'no existe' }))
+    on('process.run', async () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+    on('command.list', async () => ({ value: [] }))
+    on('ui.log', async () => ({ value: undefined }))
+    on('session.cwd', async () => ({ value: '/w' }))
+    on('session.id', async () => ({ value: 'sesion' }))
+    return { files }
+  }
+
+  const mount = ($: any) =>
+    ($ as any).ui.mount({
+      plugin: 'forge',
+      surface: 'terminal',
+      component: 'Pane',
+      requestId: 'forge',
+      props: { title: 'FORGE', isFocused: false, bodyColumns: 48, placement: 'dock', scroll: { offset: 0, bodyRows: 60, contentRows: 60 }, view: {} },
+    })
+
+  const builds = (files: Record<string, string>) => JSON.parse(files['/h/.local/state/forge/state-sesion.json']!).debugSizes.catalogBuilds
+
+  test('el catálogo se arma una sola vez por render y se reutiliza entre renders', async ($, on) => {
+    const w = await world($, on)
+    await forge($, 'cap 3')
+    const base = builds(w.files)
+    const m = await mount($)
+    await m.drawn()
+    await forge($, 'cap 3')
+    const after1 = builds(w.files)
+    expect(after1 - base).toBe(1)
+    await m.redraw()
+    await forge($, 'cap 3')
+    const after2 = builds(w.files)
+    expect(after2 - after1).toBe(0)
+  })
+})
+
+describe('phaseOf con caché negativa (hooks)', () => {
+  async function world($: any, on: any, list: () => any) {
+    let calls = 0
+    on('agent.list', async () => {
+      calls++
+      return list()
+    })
+    on('turn.complete', async (_$: any, e: any) => ({ text: e.answer }))
+    return { calls: () => calls }
+  }
+
+  const done = ($: any, agentId: string) => $.turn.complete({ agentId, answer: 'x', turnId: 't', durationMs: 1, isAborted: false } as any)
+
+  test('un subagente que no es de forge se cachea y no vuelve a consultar agent.list', async ($, on) => {
+    const w = await world($, on, () => ({ value: [{ id: 'x', type: 'general-purpose' }] }))
+    await done($, 'x')
+    await done($, 'x')
+    expect(w.calls()).toBe(1)
+  })
+
+  test('un agent.list que falla no queda cacheado', async ($, on) => {
+    const w = await world($, on, () => ({ deny: 'no hay lista' }))
+    await done($, 'x')
+    await done($, 'x')
+    expect(w.calls()).toBe(2)
+  })
+})
+
+describe('registro concurrente de agentes (hooks)', () => {
+  const forge = async ($: any, args: string) => String(((await $.command.run({ command: 'forge', args })) as any).text)
+
+  async function world($: any, on: any, register: (e: any) => any) {
+    mock.env(on, { HOME: '/h', CLAUDE_CODE_ENTRYPOINT: 'sdk-cli' })
+    mock.store(on)
+    mock.clock(on)
+    const files: Record<string, string> = {}
+    on('fs.read', async (_$: any, e: any) => ({ value: files[e.path] ?? '' }))
+    on('fs.write', async (_$: any, e: any) => {
+      files[e.path] = e.text
+      return { value: undefined }
+    })
+    on('fs.list', async () => ({ value: [] }))
+    on('fs.stat', async () => ({ deny: 'no existe' }))
+    on('process.run', async () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+    on('command.list', async () => ({ value: [] }))
+    on('ui.log', async () => ({ value: undefined }))
+    on('session.cwd', async () => ({ value: '/w' }))
+    on('session.id', async () => ({ value: 'sesion' }))
+    on('session.start', async (_$: any, e: any) => ({ cwd: e.cwd }))
+    on('agent.register', async (_$: any, e: any) => register(e))
+    return { files }
+  }
+
+  test('las seis fases se registran en paralelo', async ($, on) => {
+    let release!: () => void
+    const gate = new Promise<void>((r) => (release = r))
+    const started: string[] = []
+    await world($, on, (e: any) => {
+      started.push(e.name)
+      if (e.name === 'clarify') return gate.then(() => ({ value: { agent: `forge:${e.name}` } }))
+      return { value: { agent: `forge:${e.name}` } }
+    })
+    const p = $.session.start({ cwd: '/w', surface: null, isInteractive: false } as any)
+    const until = async (fn: () => boolean) => {
+      for (let i = 0; i < 100 && !fn(); i++) await new Promise<void>((r) => setTimeout(r, 0))
+    }
+    await until(() => started.includes('clarify'))
+    expect([...started].sort()).toEqual([...PHASES].sort())
+    release()
+    await p
+  })
+
+  test('una fase que falla se anota en registerErrors y las otras cinco quedan', async ($, on) => {
+    await world($, on, (e: any) => (e.name === 'plan' ? { deny: 'boom' } : { value: { agent: `forge:${e.name}` } }))
+    await $.session.start({ cwd: '/w', surface: null, isInteractive: false } as any)
+    const status = await forge($, 'status')
+    expect(status).toContain('⚠ no se registró forge:plan')
+    for (const p of ['clarify', 'explore', 'analyze', 'build', 'veredicto']) expect(status).not.toContain(`⚠ no se registró forge:${p}`)
+  })
+})
+
+describe('versión', () => {
+  // El kit de tests no expone node:fs ni deja importar el manifest JSON, así que
+  // este test clava VERSION y `claude plugin validate . --strict` valida el
+  // manifest; ambos se mantienen en la misma versión (0.4.1).
+  test('VERSION está exportado y coincide con la versión del manifest', () => {
+    expect(VERSION).toBe('0.4.1')
+  })
+
+  test('VERSION es un semver de tres números', () => {
+    expect(VERSION).toMatch(/^\d+\.\d+\.\d+$/)
+  })
+})
+
+describe('veredicto en segundo plano (hooks)', () => {
+  const done = (text: string, agentId = 'a') => ({ result: { status: 'completed', agentId, content: [{ type: 'text', text }], totalToolUseCount: 0, totalDurationMs: 1, totalTokens: 0, usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, server_tool_use: null, service_tier: null, cache_creation: null }, prompt: 'p' } })
+  const asyncLaunch = (agentId: string, prompt: string) => ({ result: { status: 'async_launched', agentId, description: 'd', prompt, outputFile: '/tmp/x' } })
+  const textOf = (r: any) => String(r?.result?.content?.[0]?.text ?? r?.text ?? r?.deny ?? '')
+
+  async function world($: any, on: any) {
+    mock.env(on, { HOME: '/h' })
+    mock.store(on)
+    const clock = mock.clock(on)
+    const files: Record<string, string> = {}
+    const submitted: string[] = []
+    let dir = ''
+    on('fs.read', async (_$: any, e: any) => ({ value: files[e.path] ?? '' }))
+    on('fs.write', async (_$: any, e: any) => {
+      files[e.path] = e.text
+      return { value: undefined }
+    })
+    on('fs.list', async () => ({ value: [] }))
+    on('fs.stat', async () => ({ deny: 'no existe' }))
+    on('process.run', async () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+    on('command.list', async () => ({ value: [] }))
+    on('ui.log', async () => ({ value: undefined }))
+    on('tool.call', { tool: 'Agent' }, async (_$: any, e: any) => {
+      if (e.subagent_type === 'forge:explore') return done('## Code roots\n- /w\n\nfindings de prueba, suficientemente largos para pasar.')
+      if (e.subagent_type === 'forge:plan') {
+        for (const f of ['proposal.md', 'spec.md', 'design.md']) files[`${dir}/${f}`] = `# ${f}\n\ncontenido suficiente para validar.\n`
+        files[`${dir}/tasks.md`] = '- [ ] T001 — arreglar el typo\n  - files: `README.md`\n  - depends: []\n  - evidence: `bun test` passes\n  - review: ~1 changed lines'
+        return done('plan escrito')
+      }
+      if (e.subagent_type === 'forge:build') {
+        files[`${dir}/tasks.md`] = tickTasks(files[`${dir}/tasks.md`]!, ['T001'])
+        return done('typo arreglado')
+      }
+      if (e.subagent_type === 'forge:veredicto') return asyncLaunch('ag-v', e.prompt)
+      return done('x')
+    })
+    on('session.cwd', async () => ({ value: '/w' }))
+    on('session.id', async () => ({ value: 'sesion' }))
+    on('turn.complete', async (_$: any, e: any) => ({ text: e.answer }))
+    on('prompt.submit', async (_$: any, e: any) => {
+      submitted.push(e.text)
+      return { drop: '' }
+    })
+    await $.command.run({ command: 'forge', args: 'phase clarify off' })
+    await $.command.run({ command: 'forge', args: 'phase analyze off' })
+    return {
+      files,
+      submitted,
+      clock,
+      start: async (args: string) => {
+        const r: any = await $.command.run({ command: 'forge', args })
+        dir = `/w/.sdd/${String(r.text).split(' ')[1]}`
+        await clock.advance(30)
+        return dir
+      },
+      agent: (phase: string) => $.tool.call({ tool: 'Agent', subagent_type: `forge:${phase}`, description: `forge ${phase}`, prompt: 'x' }),
+    }
+  }
+
+  test('un veredicto que termina en segundo plano manda la instrucción final', async ($, on) => {
+    const w = await world($, on)
+    const dir = await w.start('--auto arreglá un typo del README')
+    await w.agent('explore')
+    await w.agent('plan')
+    expect(textOf(await w.agent('build'))).toContain('forge:veredicto')
+    w.submitted.splice(0)
+    await w.agent('veredicto')
+    expect(w.submitted).toEqual([])
+    await $.turn.complete({ agentId: 'ag-v', answer: 'todo verde\nVEREDICTO: pasa', turnId: 'tv', durationMs: 1, isAborted: false } as any)
+    await w.clock.advance(100)
+    expect(w.submitted).toHaveLength(1)
+    expect(w.submitted[0]).toContain('Outcome: PASA')
+    expect(JSON.parse(w.files[`${dir}/run.json`]!).status).toBe('pasa')
   })
 })

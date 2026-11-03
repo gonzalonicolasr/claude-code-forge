@@ -54,13 +54,18 @@ import {
   staleRunKeys,
   isRunEntry,
   RUN_KEY,
+  normalizeRun,
+  clampCap,
+  CAP_MIN,
+  CAP_MAX,
+  CAP_DEFAULT,
 } from './logic.ts'
 import type { OtherRun } from './logic.ts'
 import type { Phase, Verdict, Mode, RunStatus, Effort, Decision, Outcome, WaveResult, Size, StartArgs } from './logic.ts'
 import { PHASE_PROMPTS, briefFor, startInstruction, nextInstruction, finalInstruction, waveChildInstruction, extraCallDenial, NODD_HINT } from './prompts.ts'
 
 const PANE = 'forge'
-const VERSION = '0.4.0'
+export const VERSION = '0.4.1'
 const CPAM = 'http://127.0.0.1:8317'
 const C = {
   violet: '#8b5cf6',
@@ -216,11 +221,23 @@ let modelLabels: Record<string, string> = {}
 let zeroNames: string[] = []
 let excluded: string[] = []
 let modelsNote = 'cargando modelos del CPAM…'
+let labelsVersion = 0
+let catalogBuilds = 0
+let catalogCache: { key: string; value: ReturnType<typeof modelCatalog> } | undefined
+
+function currentCatalog() {
+  const key = `${JSON.stringify(modelIds)}|${labelsVersion}`
+  if (!catalogCache || catalogCache.key !== key) {
+    catalogCache = { key, value: modelCatalog(modelIds, modelLabels) }
+    catalogBuilds++
+  }
+  return catalogCache.value
+}
 const registerErrors: string[] = []
 let run: Run | undefined
 let asking = false
 let stateDirReady = false
-const agentPhase = new Map<string, Phase>()
+const agentPhase = new Map<string, Phase | null>()
 const answers = new Map<string, string>()
 const stepTexts = new Map<string, string[]>()
 const handbacks = new Map<string, string>()
@@ -234,6 +251,15 @@ const HANDBACK_TOOL = {
   input_schema: { type: 'object', properties: { message: { type: 'string', description: 'your full report' } }, required: ['message'] },
 }
 const thinking = new Map<string, any[]>()
+
+// Cachés por-run: se vacían al arrancar un run nuevo o al terminar el actual,
+// así un run no hereda entradas (answers, thinking, cpamCalls, autoAgents) del anterior.
+function resetRunCaches() {
+  thinking.clear()
+  cpamCalls.clear()
+  answers.clear()
+  autoAgents.clear()
+}
 
 const now = () => Date.now()
 const stamp = () => {
@@ -332,6 +358,7 @@ async function loadConfig($: any) {
     config = {
       ...config,
       ...saved,
+      ...(saved.cap !== undefined ? { cap: clampCap(saved.cap) ?? CAP_DEFAULT } : {}),
       models: fillPhases({ ...(saved.models ? base : config.models), ...(saved.models || {}) }),
       efforts: { ...AUTO_EFFORTS, ...(profileEfforts[saved.profile] || {}), ...(saved.efforts || {}) },
       skip: Array.isArray(saved.skip) ? saved.skip.filter((p: Phase) => OPTIONAL_PHASES.includes(p)) : [],
@@ -451,7 +478,18 @@ async function exportState($: any) {
       batch: run.unit && !run.unit.whole ? { index: run.unit.index, total: run.unit.total, tasks: [...run.unit.tasks], parallel: run.unit.parallel } : undefined,
     },
   })
+  ;(snap as any).debugSizes = __debugSizes()
   await $.fs.write(statePath(home, sid), JSON.stringify(snap, null, 2) + '\n').catch(() => undefined)
+}
+
+async function safeExport($: any, where = '') {
+  try {
+    await exportState($)
+  } catch (err: any) {
+    try {
+      await $.ui.log(`forge: no pude exportar el estado${where ? ` (${where})` : ''}: ${err}`)
+    } catch {}
+  }
 }
 
 async function nervLoaded($: any) {
@@ -476,10 +514,15 @@ async function fetchModels($: any) {
   }
   const beta = await $.http.fetch(`${CPAM}/v1beta/models`, { headers: { 'x-goog-api-key': cpamKey } }).catch(() => undefined)
   try {
+    let changed = false
     for (const m of (beta?.ok ? JSON.parse(beta.text).models : []) || []) {
       const id = String(m?.name || '').replace(/^models\//, '')
-      if (id && m.displayName) modelLabels[id] = String(m.displayName)
+      if (id && m.displayName) {
+        modelLabels[id] = String(m.displayName)
+        changed = true
+      }
     }
+    if (changed) labelsVersion++
   } catch {}
   await exportState($)
   $.ui.invalidate('ui.render')
@@ -528,6 +571,7 @@ async function syncConfig($: any) {
     const next = {
       ...config,
       ...saved,
+      ...(saved.cap !== undefined ? { cap: clampCap(saved.cap) ?? CAP_DEFAULT } : {}),
       models: fillPhases({ ...config.models, ...(saved.models || {}) }),
       efforts: { ...AUTO_EFFORTS, ...(saved.efforts || {}) },
       skip: Array.isArray(saved.skip) ? saved.skip.filter((p: Phase) => OPTIONAL_PHASES.includes(p)) : [],
@@ -545,14 +589,26 @@ async function checkInbox($: any) {
   inboxBusy = true
   try {
     const path = `${home}/.local/state/forge/inbox-${sessionId}.json`
+    const st: any = await $.fs.stat(path).catch(() => undefined)
     const raw = await $.fs.read(path).catch(() => '')
-    if (!raw) return
-    const msg = JSON.parse(String(raw))
-    if (!msg?.id || msg.id === inboxSeen || msg.done) return
-    inboxSeen = msg.id
-    if (!msg.at || now() - Number(msg.at) > 30000) return
+    if (!raw || !st) return
+    let msg: any
+    try {
+      msg = JSON.parse(String(raw))
+    } catch {
+      return
+    }
+    if (!msg?.id || msg.done) return
+    const key = `${st.mtimeMs}:${st.size}:${msg.id}`
+    if (key === inboxSeen) return
+    inboxSeen = key
+    const doneText = (text: string) => JSON.stringify({ ...msg, done: true, text: text ?? '' }) + '\n'
+    if (!msg.at || now() - Number(msg.at) > 30000) {
+      await $.fs.write(path, doneText(msg.text ?? '')).catch(() => undefined)
+      return
+    }
     const text = await commandText($, String(msg.args || ''))
-    await $.fs.write(path, JSON.stringify({ ...msg, done: true, text: text ?? '' }) + '\n').catch(() => undefined)
+    await $.fs.write(path, doneText(text)).catch(() => undefined)
     $.ui.invalidate('ui.render')
   } catch {
   } finally {
@@ -609,24 +665,26 @@ async function restoreRun($: any, agentId?: string) {
   for (const dir of dirs) {
     if (run) break
     if (!(await tryHydrate($, dir, sid, agentId))) continue
-    await exportState($)
+    await safeExport($, 'restore')
     $.ui.invalidate('ui.render')
   }
 }
 
 async function hydrate($: any, dir: string, saved: any, flights: Record<string, Flight>, line: string): Promise<Run> {
+  const base = normalizeRun(saved)
+  if (!base) throw new Error('run.json inválido')
+  const { inFlight: _f, batches: _b, batchIdx: _i, ...keep } = base as any
   const log = String((await $.fs.read(`${dir}/routing.log`).catch(() => '')) || '')
-  const { inFlight: _f, batches: _b, batchIdx: _i, ...keep } = saved
-  const stats = (saved.stats || {}) as Record<Phase, Stat>
+  const stats = base.stats
   return {
     ...keep,
-    models: saved.models && typeof saved.models === 'object' ? fillPhases(saved.models) : (Object.fromEntries(PHASES.map((p) => [p, stats[p]?.model || config.models[p]])) as Record<Phase, string>),
-    efforts: saved.efforts && typeof saved.efforts === 'object' ? { ...AUTO_EFFORTS, ...saved.efforts } : (Object.fromEntries(PHASES.map((p) => [p, stats[p]?.effort || config.efforts[p]])) as Record<Phase, Effort>),
-    profile: typeof saved.profile === 'string' ? saved.profile : config.profile,
+    models: base.models && typeof base.models === 'object' ? fillPhases(base.models) : (Object.fromEntries(PHASES.map((p) => [p, stats[p]?.model || config.models[p]])) as Record<Phase, string>),
+    efforts: base.efforts && typeof base.efforts === 'object' ? { ...AUTO_EFFORTS, ...base.efforts } : (Object.fromEntries(PHASES.map((p) => [p, stats[p]?.effort || config.efforts[p]])) as Record<Phase, Effort>),
+    profile: typeof base.profile === 'string' ? base.profile : config.profile,
     flights,
-    unitIdx: Number(saved.unitIdx) || 0,
-    delivered: Array.isArray(saved.delivered) ? saved.delivered : [],
-    retryAlone: Array.isArray(saved.retryAlone) ? saved.retryAlone : [],
+    unitIdx: Number(base.unitIdx) || 0,
+    delivered: Array.isArray(base.delivered) ? base.delivered : [],
+    retryAlone: Array.isArray(base.retryAlone) ? base.retryAlone : [],
     routing: [...log.split('\n').filter(Boolean), `${stamp()} ${line}`],
   } as Run
 }
@@ -634,24 +692,18 @@ async function hydrate($: any, dir: string, saved: any, flights: Record<string, 
 async function stoppedOnDisk($: any, dir: string): Promise<any | undefined> {
   try {
     const saved = JSON.parse(String((await $.fs.read(`${dir}/run.json`).catch(() => '')) || ''))
-    const ok =
-      (saved?.status === 'cortado' || saved?.status === 'parado') &&
-      typeof saved.slug === 'string' &&
-      saved.dir === dir &&
-      typeof saved.cwd === 'string' &&
-      typeof saved.request === 'string' &&
-      Array.isArray(saved.order) &&
-      saved.order.includes(saved.expected) &&
-      saved.stats &&
-      typeof saved.stats === 'object'
-    return ok ? saved : undefined
+    if (saved?.status !== 'cortado' && saved?.status !== 'parado') return undefined
+    if (typeof saved?.cwd !== 'string') return undefined
+    const base = normalizeRun(saved)
+    if (!base || base.dir !== dir) return undefined
+    return base
   } catch {
     return undefined
   }
 }
 
-async function findStopped($: any, base: string, slug: string): Promise<{ dir: string; saved: any } | undefined> {
-  const last = await $.store.get('lastRun').catch(() => undefined)
+async function findStopped($: any, base: string, slug: string, baseOnly = false): Promise<{ dir: string; saved: any } | undefined> {
+  const last = baseOnly ? undefined : await $.store.get('lastRun').catch(() => undefined)
   const dirs = new Set<string>()
   if (typeof last === 'string' && last && (!slug || last.split('/').pop() === slug)) dirs.add(last)
   if (base && slug) dirs.add(`${base}/.sdd/${slug}`)
@@ -664,7 +716,10 @@ async function findStopped($: any, base: string, slug: string): Promise<{ dir: s
   return best
 }
 
-async function persist($: any) {
+let persistChain: Promise<void> = Promise.resolve()
+let persistPending = false
+
+async function writeRunFiles($: any) {
   await exportState($)
   if (!run) return
   if (!run.owner) run.owner = (await mySid($)) || undefined
@@ -681,6 +736,24 @@ async function persist($: any) {
   await $.fs.write(`${run.dir}/run.json`, JSON.stringify(rest, null, 2) + '\n').catch(() => undefined)
   await $.fs.write(`${run.dir}/rounds.json`, JSON.stringify({ cap: run.cap, verdicts: run.verdicts }, null, 2) + '\n').catch(() => undefined)
   await $.fs.write(`${run.dir}/routing.log`, routing.join('\n') + (routing.length ? '\n' : '')).catch(() => undefined)
+}
+
+function persist($: any): Promise<void> {
+  persistPending = true
+  const p = persistChain.then(async () => {
+    while (persistPending) {
+      persistPending = false
+      try {
+        await writeRunFiles($)
+      } catch (err: any) {
+        try {
+          await $.ui.log(`forge: no pude persistir: ${err}`)
+        } catch {}
+      }
+    }
+  })
+  persistChain = p.catch(() => {})
+  return p
 }
 
 function selectCurrent(name: string) {
@@ -778,9 +851,13 @@ async function openPane($: any) {
 
 type Handoff = { slug: string; dir: string; cwd: string; request: string; resumed?: boolean; explicit?: boolean }
 
-async function pickDir($: any, raw: string): Promise<{ dir: string } | { error: string }> {
+async function resolveDir($: any, raw: string): Promise<string> {
   if (!home) home = (await $.env.get('HOME').catch(() => '')) || ''
-  const path = (raw === '~' || raw.startsWith('~/') ? `${home}${raw.slice(1)}` : raw).replace(/\/+$/, '') || '/'
+  return (raw === '~' || raw.startsWith('~/') ? `${home}${raw.slice(1)}` : raw).replace(/\/+$/, '') || '/'
+}
+
+async function pickDir($: any, raw: string): Promise<{ dir: string } | { error: string }> {
+  const path = await resolveDir($, raw)
   if (!path.startsWith('/')) return { error: `--dir necesita una ruta absoluta (o con ~): ${raw}` }
   const st: any = await $.fs.stat(path).catch(() => undefined)
   if (st?.kind !== 'dir') return { error: `--dir ${raw}: no existe o no es un directorio` }
@@ -805,6 +882,7 @@ async function startRun($: any, args: string | StartArgs, handoff?: Handoff): Pr
   if (run && run.status === 'running') return { error: `ya hay un run corriendo (${run.slug}). /forge stop para cortarlo.` }
   const flags = typeof args === 'string' ? parseStart(args) : args
   const parsed = handoff ? { ...flags, request: handoff.request } : flags
+  if (parsed.error) return { error: parsed.error }
   if (!parsed.request) return { error: 'falta el pedido: /forge [--auto|--interactive] [--cap N] [--profile barato|calidad] [--dir <ruta>] <pedido>' }
   const chosen = !handoff && parsed.dir ? await pickDir($, parsed.dir) : undefined
   if (chosen && 'error' in chosen) return { error: chosen.error }
@@ -836,6 +914,7 @@ async function startRun($: any, args: string | StartArgs, handoff?: Handoff): Pr
     sddConfig = JSON.parse(String((await $.fs.read(`${cwd}/.sdd/config.json`).catch(() => '')) || '{}'))
   } catch {}
   const order = phaseOrder(handoff ? [...config.skip, 'clarify'] : config.skip)
+  resetRunCaches()
   run = {
     slug,
     dir,
@@ -904,12 +983,14 @@ async function continueRun($: any, args: string): Promise<{ text: string; starte
     await persist($)
     return { text: `sigo ${run.slug} desde ${run.expected}${from}`, started: true }
   }
-  if (run && run.expected && (run.status === 'parado' || run.status === 'cortado') && (!parsed.slug || parsed.slug === run.slug)) return resume()
+  if (run && run.expected && (run.status === 'parado' || run.status === 'cortado') && (!parsed.slug || parsed.slug === run.slug)) {
+    if (!parsed.dir || (await resolveDir($, parsed.dir)) === run.cwd) return resume()
+  }
   if (run && run.status === 'running') return { text: `ya hay un run corriendo (${run.slug}). /forge stop para cortarlo.`, started: false }
   const picked = parsed.dir ? await pickDir($, parsed.dir) : undefined
   if (picked && 'error' in picked) return { text: picked.error, started: false }
   const cwd = picked ? picked.dir : await $.session.cwd().catch(() => '')
-  const stopped = await findStopped($, cwd, parsed.slug)
+  const stopped = await findStopped($, cwd, parsed.slug, !!parsed.dir)
   if (stopped) {
     run = await hydrate($, stopped.dir, stopped.saved, {}, `retomado de run.json con /forge continue (estaba ${STATUS_LABEL[stopped.saved.status as RunStatus]}${stopped.saved.note ? `: ${stopped.saved.note}` : ''})`)
     run.owner = await $.session.id().catch(() => undefined)
@@ -964,6 +1045,7 @@ async function stopRun($: any, why: string) {
   run.endedAt = now()
   run.note = why
   run.routing.push(`${stamp()} parado: ${why}`)
+  resetRunCaches()
   await persist($)
   if (run.turnId) await $.turn.abort({ turnId: run.turnId }).catch(() => undefined)
   $.ui.invalidate('ui.render')
@@ -1100,8 +1182,8 @@ async function commandText($: any, args: string): Promise<string | undefined> {
     return `modo por defecto ${m}`
   }
   if (sub === 'cap') {
-    const n = Number(rest[0])
-    if (!Number.isInteger(n) || n < 1) return 'uso: /forge cap <n>'
+    const n = clampCap(rest[0])
+    if (n === undefined) return 'uso: /forge cap <n>'
     config.cap = n
     await saveConfig($)
     return `cap ${n}`
@@ -1110,10 +1192,13 @@ async function commandText($: any, args: string): Promise<string | undefined> {
 }
 
 function submitLater($: any, text: string) {
+  const owner = run
+  const ownerStatus = run?.status
   $.clock.after(30, async () => {
-    if (run) run.awaitTurn = true
+    if (!run || run !== owner || run.status !== ownerStatus) return
+    if (run.status === 'running') run.awaitTurn = true
     await $.prompt.submit({ text }).catch(async (err: any) => {
-      if (!run) return
+      if (!run || run !== owner || run.status !== ownerStatus) return
       run.note = `no pude mandar la instrucción al modelo principal: ${err} · /forge continue`
       run.routing.push(`${stamp()} ${run.note}`)
       await persist($)
@@ -1123,13 +1208,14 @@ function submitLater($: any, text: string) {
 
 function launch($: any) {
   if (!run || !run.expected) return
+  const owner = run
   $.clock.after(30, async () => {
-    if (!run || !run.expected) return
+    if (!run || run !== owner || run.status !== 'running' || !run.expected) return
     const parallel = await parallelCount($, run.expected)
-    if (!run || !run.expected) return
+    if (!run || run !== owner || run.status !== 'running' || !run.expected) return
     run.awaitTurn = true
     await $.prompt.submit({ text: startInstruction(run.slug, run.expected, parallel) }).catch(async (err: any) => {
-      if (!run) return
+      if (!run || run !== owner || run.status !== 'running') return
       run.status = 'fallido'
       run.note = `no pude mandar la instrucción de arranque: ${err}`
       await persist($)
@@ -1138,10 +1224,12 @@ function launch($: any) {
 }
 
 async function phaseOf($: any, agentId: string): Promise<Phase | undefined> {
-  if (agentPhase.has(agentId)) return agentPhase.get(agentId)
-  const info = ((await $.agent.list().catch(() => [])) as any[]).find((a: any) => a.id === agentId)
+  if (agentPhase.has(agentId)) return agentPhase.get(agentId) ?? undefined
+  const list = (await $.agent.list().catch(() => undefined)) as any[] | undefined
+  if (list === undefined) return undefined
+  const info = list.find((a: any) => a.id === agentId)
   const phase = phaseOfAgentType(info?.type)
-  if (phase) agentPhase.set(agentId, phase)
+  agentPhase.set(agentId, phase ?? null)
   return phase
 }
 
@@ -1447,6 +1535,7 @@ async function finishPhase($: any, phase: Phase, agentId: string | undefined, co
     run.expected = run.status === 'parado' ? step.next : undefined
     if (run.status === 'fallido') run.note = `${phase} no entregó dos veces: ${reason}`
     run.routing.push(`${stamp()} fin: ${STATUS_LABEL[run.status]} · veredictos ${run.verdicts.join(' → ') || '—'} · analyze ${run.decisions.join(' → ') || '—'}`)
+    resetRunCaches()
   } else if (!nextUnit) run.stats[step.next as Phase] = { ...blankStat(run.models[step.next as Phase], run.efforts[step.next as Phase]) }
   const parallel = run.status === 'running' ? await parallelCount($, step.next) : 1
   await persist($)
@@ -1505,6 +1594,7 @@ function drawPane($: any, e: any) {
     )
   }
   const phaseRows: any[] = []
+  const catalog = currentCatalog()
   for (const p of PHASES) {
     const skipped = run ? !run.order.includes(p) : config.skip.includes(p)
     const st = run?.stats[p]
@@ -1533,7 +1623,6 @@ function drawPane($: any, e: any) {
       }),
     )
     if (st?.answeredBy && state !== 'pending') phaseRows.push(t([s('  ↳ ', C.muted), s(st.answeredBy, C.pink)]))
-    const catalog = modelCatalog(modelIds, modelLabels)
     const current = config.models[p]
     const group = pickedGroup[p] || groupOf(current)
     let models = catalog.find((g) => g.group === group)?.options || []
@@ -1615,7 +1704,8 @@ function drawPane($: any, e: any) {
 }
 
 async function bumpCap($: any, delta: number) {
-  config.cap = Math.max(1, Math.min(9, config.cap + delta))
+  const next = clampCap(config.cap + delta)
+  config.cap = next ?? (delta > 0 ? CAP_MAX : CAP_MIN)
   await saveConfig($)
   $.ui.invalidate('ui.render')
 }
@@ -1640,21 +1730,25 @@ export function register(on: any) {
     cpamKey = String((await $.fs.read(`${home}/.config/cli-proxy-api/api-key.txt`).catch(() => '')) || '').trim()
     await loadConfig($)
     await restoreRun($)
-    await exportState($)
-    for (const p of PHASES) {
-      await $.agent
-        .register({
+    await safeExport($, 'session.start')
+    const results = await Promise.allSettled(
+      PHASES.map((p) =>
+        $.agent.register({
           name: p,
           description: `forge SDD phase "${p}". Only call it when a [forge] instruction asks for it.`,
           prompt: PHASE_PROMPTS[p],
           tools: PHASE_TOOLS[p],
           model: 'haiku',
-        })
-        .catch((err: any) => {
-          registerErrors.push(`forge:${p}: ${err}`)
-          $.ui.log(`forge: no pude registrar forge:${p}: ${err}`, { to: 'debug' })
-        })
-    }
+        }),
+      ),
+    )
+    results.forEach((r, i) => {
+      if (r.status === 'rejected') {
+        const p = PHASES[i]!
+        registerErrors.push(`forge:${p}: ${r.reason}`)
+        $.ui.log(`forge: no pude registrar forge:${p}: ${r.reason}`, { to: 'debug' })
+      }
+    })
     if (!headless)
       await $.command
         .register({
@@ -1713,14 +1807,16 @@ export function register(on: any) {
     if (parseContinue(args)) {
       const res = await continueRun($, args)
       if (!res.started || !run?.expected) return { drop: `forge: ${res.text}`.replace(/\n\s*/g, ' | ') }
-      return next({ ...e, text: startInstruction(run.slug, run.expected) })
+      const parallel = await parallelCount($, run.expected)
+      return next({ ...e, text: startInstruction(run.slug, run.expected, parallel) })
     }
     const text = await commandText($, args)
     if (text !== undefined) return { drop: text.replace(/\n\s*/g, ' | ') }
     const res = await startRun($, args)
     if (res.error || !run) return { drop: `forge: ${res.error}` }
     if (res.warning) $.ui.log(`forge: ${res.warning}`)
-    return next({ ...e, text: startInstruction(run.slug, run.expected || 'explore') })
+    const parallel = await parallelCount($, run.expected || 'explore')
+    return next({ ...e, text: startInstruction(run.slug, run.expected || 'explore', parallel) })
   })
 
   on('turn.start', async ($: any, e: any, next: any) => {
@@ -1945,11 +2041,11 @@ export function register(on: any) {
     const stop = data.stop_reason || (toolUses.length ? 'tool_use' : 'end_turn')
     if (st && run) {
       st.steps++
-      st.inTok += usage.input_tokens + usage.cache_read_input_tokens
+      st.inTok += usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
       st.outTok += usage.output_tokens
       st.answeredBy = `${route.model} (${usage.model})`
       if (answer) stepTexts.set(e.agentId, [...(stepTexts.get(e.agentId) || []), answer])
-      run.routing.push(`${stamp()} ${phase} paso ${e.index} · CPAM pedido ${cpamModel(route.model, effort)} · respondió ${usage.model} · stop=${stop} · tools=${toolUses.map((x) => x.name).join(',') || '-'} · in=${usage.input_tokens} cache=${usage.cache_read_input_tokens} out=${usage.output_tokens}`)
+      run.routing.push(`${stamp()} ${phase} paso ${e.index} · CPAM pedido ${cpamModel(route.model, effort)} · respondió ${usage.model} · stop=${stop} · tools=${toolUses.map((x) => x.name).join(',') || '-'} · in=${usage.input_tokens} cache=${usage.cache_read_input_tokens + usage.cache_creation_input_tokens} out=${usage.output_tokens}`)
       void persist($)
       $.ui.invalidate('ui.render')
     }
@@ -1958,19 +2054,21 @@ export function register(on: any) {
   })
 
   on('turn.complete', async ($: any, e: any, next: any) => {
-    if (e.agentId && (await phaseOf($, e.agentId))) await restoreRun($, e.agentId)
     if (e.agentId) {
       const phase = await phaseOf($, e.agentId)
-      if (phase) answers.set(e.agentId, String(e.answer || ''))
-      const flight = run?.flights[e.agentId]
-      if (phase && run && run.status === 'running' && flight) {
-        if (flight.task && run.unit?.parallel && run.unit.tasks.includes(flight.task)) {
-          const done = await childDone($, e.agentId, run.unit, flight.task, childResult(e.agentId, [{ type: 'text', text: String(e.answer || '') }]))
-          if (done.closed) submitLater($, done.text)
-        } else {
-          delete run.flights[e.agentId]
-          const text = await finishPhase($, phase, e.agentId, [{ type: 'text', text: String(e.answer || '') }])
-          submitLater($, text)
+      if (phase) {
+        await restoreRun($, e.agentId)
+        answers.set(e.agentId, String(e.answer || ''))
+        const flight = run?.flights[e.agentId]
+        if (run && run.status === 'running' && flight) {
+          if (flight.task && run.unit?.parallel && run.unit.tasks.includes(flight.task)) {
+            const done = await childDone($, e.agentId, run.unit, flight.task, childResult(e.agentId, [{ type: 'text', text: String(e.answer || '') }]))
+            if (done.closed) submitLater($, done.text)
+          } else {
+            delete run.flights[e.agentId]
+            const text = await finishPhase($, phase, e.agentId, [{ type: 'text', text: String(e.answer || '') }])
+            submitLater($, text)
+          }
         }
       }
       return next(e)
@@ -1989,6 +2087,7 @@ export function register(on: any) {
       run.endedAt = now()
       run.note = `${why} antes de cerrar el run · /forge continue`
       run.routing.push(`${stamp()} ${run.note}`)
+      resetRunCaches()
       $.ui.log(`forge: run ${run.slug} cortado: ${run.note}`)
       await persist($)
       $.ui.invalidate('ui.render')
@@ -2011,4 +2110,8 @@ export function register(on: any) {
       return Text({ wrap: 'truncate', color: C.red, children: [`forge: no pude dibujar el panel: ${err}`] })
     }
   })
+}
+
+export function __debugSizes() {
+  return { thinking: thinking.size, cpamCalls: cpamCalls.size, answers: answers.size, autoAgents: autoAgents.size, catalogBuilds }
 }

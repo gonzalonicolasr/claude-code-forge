@@ -9,6 +9,15 @@ export const PHASES: readonly Phase[] = ['clarify', 'explore', 'plan', 'analyze'
 export const OPTIONAL_PHASES: readonly Phase[] = ['clarify', 'analyze']
 export const VERDICTS: readonly Verdict[] = ['pasa', 'corregir', 'replantear']
 export const REPLAN_CAP = 2
+export const CAP_MIN = 1
+export const CAP_MAX = 9
+export const CAP_DEFAULT = 3
+
+export function clampCap(v: unknown): number | undefined {
+  const n = Number(v)
+  if (!Number.isInteger(n) || n < CAP_MIN || n > CAP_MAX) return undefined
+  return n
+}
 export const CLAUDE_ALIASES = ['haiku', 'sonnet', 'opus', 'fable']
 export const CLAUDE_IDS: Record<string, string> = {
   haiku: 'claude-haiku-4-5-20251001',
@@ -461,7 +470,7 @@ export function slugify(text: string, taken: readonly string[] = []): string {
   return slug
 }
 
-export type StartArgs = { request: string; mode?: Mode; cap?: number; profile?: string; dir?: string }
+export type StartArgs = { request: string; mode?: Mode; cap?: number; profile?: string; dir?: string; error?: string }
 
 export function parseStart(args: string): StartArgs {
   const out: StartArgs = { request: '' }
@@ -471,10 +480,32 @@ export function parseStart(args: string): StartArgs {
     const t = toks[i]
     if (t === '--auto' || t === '--automatic') out.mode = 'automatic'
     else if (t === '--interactive' || t === '--interactivo') out.mode = 'interactive'
-    else if (t === '--cap' && /^\d+$/.test(toks[i + 1] || '')) out.cap = Math.max(1, Number(toks[++i]))
-    else if (t === '--profile' && toks[i + 1]) out.profile = toks[++i]
-    else if (t === '--dir' && toks[i + 1]) out.dir = toks[++i]
-    else rest.push(t)
+    else if (t === '--cap') {
+      const v = toks[i + 1]
+      const n = v === undefined || v.startsWith('--') ? undefined : clampCap(v)
+      if (n === undefined) {
+        out.error = 'cap inválido: usá --cap N con N entre 1 y 9'
+        break
+      }
+      out.cap = n
+      i++
+    } else if (t === '--profile') {
+      const v = toks[i + 1]
+      if (v === undefined || v.startsWith('--')) {
+        out.error = 'falta el valor de --profile'
+        break
+      }
+      out.profile = v
+      i++
+    } else if (t === '--dir') {
+      const v = toks[i + 1]
+      if (v === undefined || v.startsWith('--')) {
+        out.error = 'falta el valor de --dir'
+        break
+      }
+      out.dir = v
+      i++
+    } else rest.push(t)
   }
   out.request = rest.join(' ')
   return out
@@ -723,6 +754,83 @@ export function staleRunKeys(entries: Record<string, unknown>, at: number): stri
   return Object.entries(entries)
     .filter(([k, e]) => k.startsWith(RUN_KEY) && (!isRunEntry(e) || at - (Number(e.at) || 0) > (e.status === 'running' ? RUNNING_STALE : DONE_STALE)))
     .map(([k]) => k)
+}
+
+const PHASE_SET = new Set<Phase>(PHASES)
+
+function zeroPhaseStat(): PhaseStat {
+  return { status: 'pending', model: '', effort: undefined, answeredBy: '', ms: 0, startedAt: 0, inTok: 0, outTok: 0, steps: 0 }
+}
+
+export type NormalizedRun = {
+  slug: string
+  dir: string
+  cwd: string
+  request: string
+  mode: Mode
+  cap: number
+  verdicts: Verdict[]
+  expected?: Phase
+  status: RunStatus
+  order: Phase[]
+  startedAt: number
+  endedAt?: number
+  stats: Record<Phase, PhaseStat>
+  models?: Record<Phase, string>
+  efforts?: Record<Phase, Effort>
+  profile?: string
+  decisions: Decision[]
+  clarified: boolean
+  size?: Size
+  tdd: 'strict' | 'off'
+  unit?: any
+  unitIdx?: number
+  delivered: string[]
+  retryAlone: { id: string; reason: string }[]
+  blockers?: string
+  feedback?: { verdict: Verdict; text: string }
+  lastVerdictText?: string
+  adjust?: string
+  retried: boolean
+  retryReason?: string
+  note: string
+  routing: string[]
+  turnId?: string
+  awaitTurn: boolean
+  flights?: Record<string, any>
+  asyncSeen: boolean
+  owner?: string
+  origin?: 'nodd'
+}
+
+export function normalizeRun(saved: unknown): NormalizedRun | undefined {
+  if (!saved || typeof saved !== 'object') return undefined
+  const s = saved as any
+  if (typeof s.slug !== 'string' || typeof s.dir !== 'string' || typeof s.request !== 'string') return undefined
+  if (!Array.isArray(s.order) || !s.order.length || s.order.some((p: unknown) => typeof p !== 'string' || !PHASE_SET.has(p as Phase))) return undefined
+  if (s.expected !== undefined && s.expected !== '' && !s.order.includes(s.expected)) return undefined
+  const order = s.order as Phase[]
+  const stats = {} as Record<Phase, PhaseStat>
+  for (const p of order) {
+    const got = s.stats?.[p]
+    stats[p] = got && typeof got === 'object' ? { ...zeroPhaseStat(), ...got } : zeroPhaseStat()
+  }
+  return {
+    ...s,
+    slug: s.slug,
+    dir: s.dir,
+    cwd: typeof s.cwd === 'string' ? s.cwd : s.dir,
+    request: s.request,
+    order,
+    expected: s.expected === '' ? undefined : s.expected,
+    stats,
+    verdicts: Array.isArray(s.verdicts) ? s.verdicts : [],
+    decisions: Array.isArray(s.decisions) ? s.decisions : [],
+    routing: Array.isArray(s.routing) ? s.routing : [],
+    cap: clampCap(s.cap) ?? CAP_DEFAULT,
+    awaitTurn: s.status === 'running' ? true : s.awaitTurn === true,
+    turnId: s.status === 'running' ? undefined : s.turnId,
+  } as NormalizedRun
 }
 
 export function exportStatus(status: RunStatus, asking: boolean): ExportStatus {
