@@ -65,7 +65,7 @@ import type { Phase, Verdict, Mode, RunStatus, Effort, Decision, Outcome, WaveRe
 import { PHASE_PROMPTS, briefFor, startInstruction, nextInstruction, finalInstruction, waveChildInstruction, extraCallDenial, NODD_HINT } from './prompts.ts'
 
 const PANE = 'forge'
-export const VERSION = '0.4.1'
+export const VERSION = '0.4.2'
 const CPAM = 'http://127.0.0.1:8317'
 const C = {
   violet: '#8b5cf6',
@@ -237,6 +237,7 @@ const registerErrors: string[] = []
 let run: Run | undefined
 let asking = false
 let stateDirReady = false
+let endedSid = ''
 const agentPhase = new Map<string, Phase | null>()
 const answers = new Map<string, string>()
 const stepTexts = new Map<string, string[]>()
@@ -555,17 +556,22 @@ async function syncProfiles($: any, gen: number): Promise<boolean> {
   return JSON.stringify([profiles, profileEfforts]) !== before
 }
 
-async function syncConfig($: any) {
-  if (syncBusy || editing) return
+async function syncConfig($: any): Promise<boolean> {
+  if (syncBusy || editing) return false
   syncBusy = true
   const gen = editGen
+  let changed = false
   try {
-    if (await syncProfiles($, gen)) $.ui.invalidate('ui.render')
-    if (editing || gen !== editGen) return
+    if (await syncProfiles($, gen)) {
+      changed = true
+      $.ui.invalidate('ui.render')
+    }
+    if (editing || gen !== editGen) return changed
     const { saved, scope } = await savedConfig($)
-    if (!saved || typeof saved !== 'object' || editing || gen !== editGen) return
+    if (!saved || typeof saved !== 'object' || editing || gen !== editGen) return changed
     if (scope !== configScope) {
       configScope = scope
+      changed = true
       $.ui.invalidate('ui.render')
     }
     const next = {
@@ -576,12 +582,22 @@ async function syncConfig($: any) {
       efforts: { ...AUTO_EFFORTS, ...(saved.efforts || {}) },
       skip: Array.isArray(saved.skip) ? saved.skip.filter((p: Phase) => OPTIONAL_PHASES.includes(p)) : [],
     }
-    if (JSON.stringify(next) === JSON.stringify(config)) return
+    if (JSON.stringify(next) === JSON.stringify(config)) return changed
     config = next
     $.ui.invalidate('ui.render')
+    return true
   } finally {
     syncBusy = false
   }
+}
+
+// NERV lee el state-<sesión>.json, no la memoria de forge: un perfil nuevo en ~/.pi/zero.json o una sesión
+// sin archivo (tras /clear cambia el id y no hay session.start) dejaban el panel con el state.json viejo.
+async function syncAndExport($: any) {
+  const changed = await syncConfig($)
+  const sid = await mySid($)
+  if (!home || !sid || sid === endedSid) return
+  if (changed || !(await $.fs.stat(statePath(home, sid)).catch(() => undefined))) await safeExport($, 'sync')
 }
 
 async function checkInbox($: any) {
@@ -1763,7 +1779,7 @@ export function register(on: any) {
     $.clock.every(120, () => {
       frame++
       if (frame % 3 === 0) void checkInbox($)
-      if (frame % 40 === 4) void syncConfig($)
+      if (frame % 40 === 4) void syncAndExport($)
       if (paneOpen && run?.status === 'running') $.ui.invalidate('ui.render')
     })
     return r
@@ -1771,6 +1787,7 @@ export function register(on: any) {
 
   on('session.end', async ($: any, e: any, next: any) => {
     const sid = await mySid($)
+    endedSid = sid
     if (home && sid) await $.process.run(['rm', '-f', statePath(home, sid)]).catch(() => undefined)
     return next(e)
   })

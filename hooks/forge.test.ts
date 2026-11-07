@@ -1718,6 +1718,46 @@ describe('un run por sesión (hooks)', () => {
     expect(await forge($, 'config reset')).toBe('esta sesión vuelve a la config default (perfil turbo)')
     expect(store['config:B']).toBe(undefined)
   })
+
+  test('el tick reescribe el state de la sesión si falta (id nuevo tras /clear) o si zero.json suma perfiles', async ($, on) => {
+    let sid = 'A'
+    let zero = { profiles: { uno: { models: { explore: 'm', plan: 'm', build: 'm', veredicto: 'm' } } } }
+    const files: Record<string, string> = {}
+    mock.env(on, { HOME: '/h' })
+    on('store.get', async () => ({ value: undefined }))
+    on('store.set', async () => ({ value: undefined }))
+    on('store.delete', async () => ({ value: undefined }))
+    on('store.keys', async () => ({ value: [] }))
+    const clock = mock.clock(on)
+    on('fs.read', async (_$: any, e: any) => ({ value: e.path === '/h/.pi/zero.json' ? JSON.stringify(zero) : (files[e.path] ?? '') }))
+    on('fs.write', async (_$: any, e: any) => {
+      files[e.path] = e.text
+      return { value: undefined }
+    })
+    on('fs.list', async () => ({ deny: 'no existe' }))
+    on('fs.stat', async (_$: any, e: any) =>
+      e.path === '/h/.pi/zero.json' ? { value: { kind: 'file', size: JSON.stringify(zero).length, mtimeMs: 1 } } : e.path in files ? { value: { kind: 'file', size: 1, mtimeMs: 1 } } : { deny: 'no existe' },
+    )
+    on('process.run', async (_$: any, e: any) => {
+      if (e.argv?.[0] === 'rm') delete files[e.argv[2]]
+      return { value: { exitCode: 0, stdout: '', stderr: '' } }
+    })
+    on('command.list', async () => ({ value: [] }))
+    on('ui.log', async () => ({ value: undefined }))
+    on('session.cwd', async () => ({ value: '/w' }))
+    on('session.id', async () => ({ value: sid }))
+    on('session.start', async (_$: any, e: any) => ({ cwd: e.cwd }))
+    on('agent.register', async () => ({ value: undefined }))
+    await $.session.start({ cwd: '/w', surface: null, isInteractive: false } as any)
+    const zeros = (id: string) => Object.keys(JSON.parse(files[`/h/.local/state/forge/state-${id}.json`]!).profiles).filter((n) => n.startsWith('zero:'))
+    expect(zeros('A')).toEqual(['zero:uno'])
+    sid = 'B'
+    await clock.advance(120 * 40)
+    expect(zeros('B')).toEqual(['zero:uno'])
+    zero = { profiles: { ...zero.profiles, dos: { models: { explore: 'm', plan: 'm', build: 'm', veredicto: 'm' } } } }
+    await clock.advance(120 * 40)
+    expect(zeros('B')).toEqual(['zero:uno', 'zero:dos'])
+  })
 })
 
 describe('dispatch retardado (hooks)', () => {
@@ -2426,9 +2466,9 @@ describe('registro concurrente de agentes (hooks)', () => {
 describe('versión', () => {
   // El kit de tests no expone node:fs ni deja importar el manifest JSON, así que
   // este test clava VERSION y `claude plugin validate . --strict` valida el
-  // manifest; ambos se mantienen en la misma versión (0.4.1).
+  // manifest; ambos se mantienen en la misma versión (0.4.2).
   test('VERSION está exportado y coincide con la versión del manifest', () => {
-    expect(VERSION).toBe('0.4.1')
+    expect(VERSION).toBe('0.4.2')
   })
 
   test('VERSION es un semver de tres números', () => {
