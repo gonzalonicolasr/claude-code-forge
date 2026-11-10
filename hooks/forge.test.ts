@@ -1012,6 +1012,7 @@ test('el panel dibuja las seis fases con su modelo, el saltear de los gates y el
 describe('comandos lentos', () => {
   test('toda fase corre lo lento una sola vez a un log; sólo el último lote de build corre la suite completa', () => {
     for (const p of PHASES) expect(PHASE_PROMPTS[p]).toContain('**Slow commands run once.**')
+    for (const p of PHASES) expect(PHASE_PROMPTS[p]).toContain('/tmp/forge-<run slug>-<phase>-<task or batch>.log')
     expect(PHASE_PROMPTS.build).toContain('only the last one does')
     expect(PHASE_PROMPTS.veredicto).toContain('once, into a log')
     const base = { slug: 's', dir: '/w/.sdd/s', cwd: '/w', request: 'x', round: 1, cap: 3, phase: 'build' as const }
@@ -1028,6 +1029,7 @@ describe('sin sobreingeniería', () => {
     expect(PHASE_PROMPTS.clarify).toContain('**Assume the simplest version.**')
     expect(PHASE_PROMPTS.plan).toContain('**Plan the smallest thing that satisfies the request.**')
     expect(PHASE_PROMPTS.plan).toContain('## Not doing')
+    expect(PHASE_PROMPTS.plan).toContain('a convention this change leaves stale')
     expect(PHASE_PROMPTS.plan).toContain('**Few tasks, short artifacts.**')
     expect(PHASE_PROMPTS.build).toContain('**Minimum code.**')
     expect(PHASE_PROMPTS.analyze).toContain('is over-scope and a defect')
@@ -2492,9 +2494,9 @@ describe('registro concurrente de agentes (hooks)', () => {
 describe('versión', () => {
   // El kit de tests no expone node:fs ni deja importar el manifest JSON, así que
   // este test clava VERSION y `claude plugin validate . --strict` valida el
-  // manifest; ambos se mantienen en la misma versión (0.4.4).
+  // manifest; ambos se mantienen en la misma versión (0.4.5).
   test('VERSION está exportado y coincide con la versión del manifest', () => {
-    expect(VERSION).toBe('0.4.4')
+    expect(VERSION).toBe('0.4.5')
   })
 
   test('VERSION es un semver de tres números', () => {

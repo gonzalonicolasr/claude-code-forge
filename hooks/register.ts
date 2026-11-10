@@ -65,7 +65,7 @@ import type { Phase, Verdict, Mode, RunStatus, Effort, Decision, Outcome, WaveRe
 import { PHASE_PROMPTS, briefFor, startInstruction, nextInstruction, finalInstruction, waveChildInstruction, extraCallDenial, NODD_HINT } from './prompts.ts'
 
 const PANE = 'forge'
-export const VERSION = '0.4.4'
+export const VERSION = '0.4.5'
 const CPAM = 'http://127.0.0.1:8317'
 const C = {
   violet: '#8b5cf6',
