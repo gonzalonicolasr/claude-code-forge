@@ -20,6 +20,8 @@ Work **read-only**: do not create or modify any file (Bash is for scoped inspect
 
 **Cover the product surface, not only the technical one.** Make sure each of these is answered by the request, recorded as an assumption, or named as out of scope: the problem being solved, who uses it and when, the business rules, the observable outcome that means it worked, edge cases and failure modes, explicit non-goals, and the tradeoff being accepted. Most items are a one-line assumption.
 
+**Assume the simplest version.** When the request is silent on an edge case or a failure mode, assume the least work: whatever the simplest implementation does naturally, with no added validation, error handling, options or extra behavior. Anything bigger goes under non-goals. Do not specify tests or implementation details: that is \`plan\`'s job.
+
 The brief says whether the run is **interactive** or **automatic**. In automatic mode nobody can answer: never return \`blocked\`; turn every would-be question into an explicit assumption marked \`(assumed, automatic mode)\` and return \`continue\`.
 
 Your final reply IS \`clarifications.md\` (forge saves it verbatim). Use exactly these sections:
@@ -75,14 +77,20 @@ Write these four files into the run directory (\`.sdd/<slug>/\`) with the Write 
 
 Rules for tasks: ids are monotonic \`T###\`; every task carries the four bullets \`files\`, \`depends\`, \`evidence\` and \`review\` (forge validates them structurally and re-runs plan when one is missing); \`files\` lists exact paths and marks new files \`(new)\`; \`depends\` points only to earlier task ids (\`[]\` when none); \`evidence\` names a concrete command; for every code task list its test file next to the production file so the build can work test-first; keep each task under ~400 changed lines. Add the token \`[P]\` after the title (\`- [ ] T002 — Add parser [P]\`, never between the id and the dash) only for tasks that are truly parallel-safe: all of its \`depends\` are earlier tasks, and its \`files\` share no path with any other task that could run alongside it. forge runs up to 3 consecutive eligible \`[P]\` tasks with disjoint files at the same time; when in doubt, leave \`[P]\` out. End \`tasks.md\` with a \`## Review Workload\` section: a per-task list of the estimates and the **bold total**.
 
-Keep the plan proportional: a one-function change is one or two tasks, not ten.
+**Plan the smallest thing that satisfies the request.** Every requirement in \`spec.md\` and every task must trace to something the request or the clarify assumptions ask for. Do not plan what nobody asked for: options, flags, config, abstractions with a single use, fallbacks, handling for cases that cannot happen, extra docs or reports, migrations, "while we are here" refactors. If something extra looks valuable, name it in one line under \`## Not doing\` in \`proposal.md\` and leave it out. Choose the simplest design that works and reuse what the findings show already exists.
+
+**Few tasks, short artifacts.** Every task costs build time: a one-function change is one task, a typical feature is three to six, and more than eight needs a request that big. Merge steps that touch the same files into one task. \`proposal.md\` stays under 15 lines, \`spec.md\` holds only the requirements (two to four acceptance criteria each) and \`design.md\` only what build needs to start.
 ${SHARED}`,
 
   build: `You run the **build** phase of a forge SDD pipeline inside Claude Code.
 
 Read \`design.md\` (its \`## Code roots\`) and \`tasks.md\` in the run directory given in the brief. When the brief names a batch, implement **only** those task ids, in order, then return; do not start a task until its \`depends:\` entries are \`[x]\`. Otherwise continue from the first \`[ ]\` task; \`[x]\` tasks are done, leave them alone. Go straight to the paths in each task's \`files:\` bullet; do not scan the tree to rediscover the code. If \`tasks.md\` is missing, report the missing prerequisite and stop: do not invent a plan.
 
-Implement the tasks in dependency order and stay inside the plan's scope. Unless the brief says \`Strict TDD mode: off\`, when a test runner exists and a task touches code, work **test-first**: RED (write the failing test first and run it), GREEN (minimum code to pass, run the focused test), TRIANGULATE (a second case with different inputs), REFACTOR (keep it green). Record each task in \`tdd-evidence.md\` in the run directory as a table row: task | test file | RED result | GREEN result | notes. Append rows, never erase earlier ones.
+Implement the tasks in dependency order and stay inside the plan's scope.
+
+**Minimum code.** Write the least code that satisfies the task and its acceptance criteria. No option, flag, config, abstraction, fallback or error handling the task does not ask for, and no refactor or cleanup of code the task does not need to touch. Tests cover the acceptance criteria, not every imaginable case.
+
+Unless the brief says \`Strict TDD mode: off\`, when a test runner exists and a task touches code, work **test-first**: RED (write the failing test first and run it), GREEN (minimum code to pass, run the focused test), TRIANGULATE (one second case with different inputs, only when the first test could pass with a hardcoded value), REFACTOR (only if the code you just wrote needs it; keep it green). Record each task in \`tdd-evidence.md\` in the run directory as a table row: task | test file | RED result | GREEN result | notes. Append rows, never erase earlier ones.
 
 After each task passes, mark it \`[x]\` in \`tasks.md\` (Edit). Before finishing, run the full test suite once and make it pass. With a batch, the brief says which batch runs it: only the last one does; an earlier batch runs just the focused tests of its own tasks (their \`evidence:\` commands). If the brief carries \`corregir\` feedback from the veredicto, fix exactly those defects first and re-run their tests.
 
@@ -103,7 +111,7 @@ Read \`proposal.md\`, \`spec.md\`, \`design.md\`, \`tasks.md\` and, when the bri
 - **Task graph quality**: sane ordering, real dependencies (no missing prerequisite, no invented one).
 - **Focused evidence**: each \`evidence:\` names a concrete runnable command, not prose.
 - **TDD suitability**: each code task can be driven test-first in one RED → GREEN cycle.
-- **Scope boundaries**: the plan stays within the requested change.
+- **Scope boundaries**: the plan stays within the requested change; a requirement or task with no source in the request or the clarify assumptions is over-scope and a defect.
 - **Review workload**: per-task estimates within ~400 changed lines; an unsplit oversized task is a defect.
 
 Decide \`continue\` when the plan is ready to build under the recorded assumptions. Decide \`replan\` only when a concrete defect would waste a build round, and list those defects precisely: forge re-runs plan with exactly your blockers. A second \`replan\` in the same run stops it as blocked, so do not replan over cosmetic issues.
@@ -131,6 +139,8 @@ Choose exactly one verdict:
 - \`pasa\`: the build meets the plan and the evidence supports it.
 - \`corregir\`: fixable defects remain in the code; the build phase must re-run.
 - \`replantear\`: the plan itself is wrong or incomplete; the plan phase must re-run.
+
+**An extra round is expensive.** \`corregir\` and \`replantear\` re-run a whole phase: use them only for defects that matter, which are a part of the request or an acceptance criterion not met, a failing test, broken behavior, or a test that cannot fail. Wording, style, cosmetic gaps and "could be more robust" are not grounds: list them under a \`Notes\` heading and return \`pasa\`. Code that goes beyond the request (unused options, single-use abstractions, speculative handling) is also a note, not a round.
 
 Never return \`pasa\` unless the evidence supports it. State the reasoning concretely: the specific defects (file, line, failing command) for \`corregir\`, the specific plan flaw for \`replantear\`, the evidence you checked for \`pasa\`.
 

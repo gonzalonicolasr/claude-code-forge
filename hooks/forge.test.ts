@@ -1023,6 +1023,18 @@ describe('comandos lentos', () => {
   })
 })
 
+describe('sin sobreingeniería', () => {
+  test('clarify, plan, build, analyze y veredicto piden lo mínimo que cumple el pedido', () => {
+    expect(PHASE_PROMPTS.clarify).toContain('**Assume the simplest version.**')
+    expect(PHASE_PROMPTS.plan).toContain('**Plan the smallest thing that satisfies the request.**')
+    expect(PHASE_PROMPTS.plan).toContain('## Not doing')
+    expect(PHASE_PROMPTS.plan).toContain('**Few tasks, short artifacts.**')
+    expect(PHASE_PROMPTS.build).toContain('**Minimum code.**')
+    expect(PHASE_PROMPTS.analyze).toContain('is over-scope and a defect')
+    expect(PHASE_PROMPTS.veredicto).toContain('**An extra round is expensive.**')
+  })
+})
+
 describe('estado exportado', () => {
   test('el snapshot trae los perfiles de fábrica marcados, el catálogo y run null', () => {
     const snap = stateSnapshot({
@@ -2480,9 +2492,9 @@ describe('registro concurrente de agentes (hooks)', () => {
 describe('versión', () => {
   // El kit de tests no expone node:fs ni deja importar el manifest JSON, así que
   // este test clava VERSION y `claude plugin validate . --strict` valida el
-  // manifest; ambos se mantienen en la misma versión (0.4.3).
+  // manifest; ambos se mantienen en la misma versión (0.4.4).
   test('VERSION está exportado y coincide con la versión del manifest', () => {
-    expect(VERSION).toBe('0.4.3')
+    expect(VERSION).toBe('0.4.4')
   })
 
   test('VERSION es un semver de tres números', () => {
