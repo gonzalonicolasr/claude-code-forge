@@ -1009,6 +1009,20 @@ test('el panel dibuja las seis fases con su modelo, el saltear de los gates y el
   expect(await m.find({ key: 'start' })).toBeDefined()
 })
 
+describe('comandos lentos', () => {
+  test('toda fase corre lo lento una sola vez a un log; sólo el último lote de build corre la suite completa', () => {
+    for (const p of PHASES) expect(PHASE_PROMPTS[p]).toContain('**Slow commands run once.**')
+    expect(PHASE_PROMPTS.build).toContain('only the last one does')
+    expect(PHASE_PROMPTS.veredicto).toContain('once, into a log')
+    const base = { slug: 's', dir: '/w/.sdd/s', cwd: '/w', request: 'x', round: 1, cap: 3, phase: 'build' as const }
+    const mid = briefFor({ ...base, batch: { index: 0, total: 3, tasks: ['T001'] } })
+    const last = briefFor({ ...base, batch: { index: 2, total: 3, tasks: ['T009'] } })
+    expect([mid.includes('This is not the last batch'), mid.includes('This is the last batch')]).toEqual([true, false])
+    expect([last.includes('This is not the last batch'), last.includes('This is the last batch')]).toEqual([false, true])
+    expect(briefFor(base)).not.toContain('last batch')
+  })
+})
+
 describe('estado exportado', () => {
   test('el snapshot trae los perfiles de fábrica marcados, el catálogo y run null', () => {
     const snap = stateSnapshot({
@@ -2466,9 +2480,9 @@ describe('registro concurrente de agentes (hooks)', () => {
 describe('versión', () => {
   // El kit de tests no expone node:fs ni deja importar el manifest JSON, así que
   // este test clava VERSION y `claude plugin validate . --strict` valida el
-  // manifest; ambos se mantienen en la misma versión (0.4.2).
+  // manifest; ambos se mantienen en la misma versión (0.4.3).
   test('VERSION está exportado y coincide con la versión del manifest', () => {
-    expect(VERSION).toBe('0.4.2')
+    expect(VERSION).toBe('0.4.3')
   })
 
   test('VERSION es un semver de tres números', () => {
@@ -2549,5 +2563,25 @@ describe('veredicto en segundo plano (hooks)', () => {
     expect(w.submitted).toHaveLength(1)
     expect(w.submitted[0]).toContain('Outcome: PASA')
     expect(JSON.parse(w.files[`${dir}/run.json`]!).status).toBe('pasa')
+  })
+
+  test('el aviso de fin de una fase de forge no abre un turno: se descarta antes y después de cerrarla; el de otro agente pasa', async ($, on) => {
+    const w = await world($, on)
+    await w.start('--auto arreglá un typo del README')
+    await w.agent('explore')
+    await w.agent('plan')
+    await w.agent('build')
+    await w.agent('veredicto')
+    w.submitted.splice(0)
+    const note = (id: string, status = 'completed') => ({ text: `<task-notification>\n<task-id>${id}</task-id>\n<status>${status}</status>\n<result>x</result>\n</task-notification>`, origin: { kind: 'task-notification' } }) as any
+    expect(await $.prompt.submit(note('ag-v'))).toEqual({ drop: 'forge: sigue con la instrucción de forge' })
+    await $.prompt.submit(note('ag-v', 'failed'))
+    await $.prompt.submit(note('otro-agente'))
+    expect(w.submitted).toHaveLength(2)
+    await $.turn.complete({ agentId: 'ag-v', answer: 'todo verde\nVEREDICTO: pasa', turnId: 'tv', durationMs: 1, isAborted: false } as any)
+    await w.clock.advance(100)
+    w.submitted.splice(0)
+    expect(await $.prompt.submit(note('ag-v'))).toEqual({ drop: 'forge: sigue con la instrucción de forge' })
+    expect(w.submitted).toEqual([])
   })
 })

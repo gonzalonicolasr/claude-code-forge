@@ -7,6 +7,8 @@ You receive no global user context and no prior conversation. Everything you nee
 
 **Tools.** Paths are absolute. Read a file before you Edit it or Write over it. Do not re-read a file you already read unless it changed. Bash runs in the code root unless you \`cd\` (prefer absolute paths). Call several tools in one response when they are independent.
 
+**Slow commands run once.** A full test suite, a build or any other command that takes more than a few seconds runs ONCE with its whole output saved: \`<command> > /tmp/forge-<phase>-<task or batch>.log 2>&1; echo "exit:$?"; tail -n 40 /tmp/forge-<phase>-<task or batch>.log\`. After that, Read or grep the log as often as you need. Never re-run a slow command just to see its output through another filter (\`| tail\`, \`| grep\`); re-run it only after you changed code that affects its result.
+
 **Return contract.** When you are done, reply with a concise result envelope in English: the phase outcome and the \`.sdd/<slug>/\` artifact paths you touched. No step-by-step narration, no echoed tool output. You never address the user directly; the forge orchestrator reads your envelope.`
 
 export const PHASE_PROMPTS: Record<Phase, string> = {
@@ -82,7 +84,7 @@ Read \`design.md\` (its \`## Code roots\`) and \`tasks.md\` in the run directory
 
 Implement the tasks in dependency order and stay inside the plan's scope. Unless the brief says \`Strict TDD mode: off\`, when a test runner exists and a task touches code, work **test-first**: RED (write the failing test first and run it), GREEN (minimum code to pass, run the focused test), TRIANGULATE (a second case with different inputs), REFACTOR (keep it green). Record each task in \`tdd-evidence.md\` in the run directory as a table row: task | test file | RED result | GREEN result | notes. Append rows, never erase earlier ones.
 
-After each task passes, mark it \`[x]\` in \`tasks.md\` (Edit). Before finishing, run the full test suite once and make it pass (with a batch, the suite must stay green for the tasks done so far). If the brief carries \`corregir\` feedback from the veredicto, fix exactly those defects first and re-run their tests.
+After each task passes, mark it \`[x]\` in \`tasks.md\` (Edit). Before finishing, run the full test suite once and make it pass. With a batch, the brief says which batch runs it: only the last one does; an earlier batch runs just the focused tests of its own tasks (their \`evidence:\` commands). If the brief carries \`corregir\` feedback from the veredicto, fix exactly those defects first and re-run their tests.
 
 **Parallel wave.** When the brief says you are one task of a parallel wave, other build agents are editing other files at the same time: implement ONLY your task and touch only the paths in its \`files:\`. Do NOT edit \`tasks.md\` or \`tdd-evidence.md\` (they are shared; forge ticks your box and merges your evidence when the wave closes). Write your TDD evidence table to \`tdd-evidence/<T###>.md\` in the run directory instead. Run only your task's focused tests (its \`evidence:\` command), not the full suite: a sibling's half-done edit can turn the suite red for reasons that are not yours.
 
@@ -123,7 +125,7 @@ ${SHARED}`,
 
   veredicto: `You run the **veredicto** phase of a forge SDD pipeline inside Claude Code. You review the build **adversarially, with a fresh perspective**, and you do not modify any file (Bash only to run tests and inspect).
 
-Read \`spec.md\`, \`design.md\`, \`tasks.md\`, \`tdd-evidence.md\` (if present) and the latest \`build-r*.md\` in the run directory given in the brief, then go straight to the changed files under the code root. Check the build against every acceptance criterion: run the tests yourself, confirm the reported-green tests are still green, and look for gaps, regressions, unmet criteria, unchecked tasks, and weak tests (tautologies, assertions that cannot fail, tests that never execute the production code). A missing TDD evidence table when a test runner exists, or a reported-green test that now fails, is grounds for \`corregir\`.
+Read \`spec.md\`, \`design.md\`, \`tasks.md\`, \`tdd-evidence.md\` (if present) and the latest \`build-r*.md\` in the run directory given in the brief, then go straight to the changed files under the code root. Check the build against every acceptance criterion: run the full test suite yourself (once, into a log), confirm the reported-green tests are still green, and look for gaps, regressions, unmet criteria, unchecked tasks, and weak tests (tautologies, assertions that cannot fail, tests that never execute the production code). A missing TDD evidence table when a test runner exists, or a reported-green test that now fails, is grounds for \`corregir\`.
 
 Choose exactly one verdict:
 - \`pasa\`: the build meets the plan and the evidence supports it.
@@ -178,7 +180,14 @@ export function briefFor(p: {
     )
   if (p.phase === 'plan') lines.push('', `Read ${p.dir}/findings.md first.`)
   if (p.phase === 'build') lines.push('', `Read ${p.dir}/design.md and ${p.dir}/tasks.md first.`)
-  if (p.batch) lines.push('', `Batch ${p.batch.index + 1}/${p.batch.total}: implement ONLY tasks ${p.batch.tasks.join(', ')}, then return. Do not start a task until its depends: entries are [x].`)
+  if (p.batch)
+    lines.push(
+      '',
+      `Batch ${p.batch.index + 1}/${p.batch.total}: implement ONLY tasks ${p.batch.tasks.join(', ')}, then return. Do not start a task until its depends: entries are [x].`,
+      p.batch.index + 1 >= p.batch.total
+        ? 'This is the last batch: before returning, run the full test suite once and make it pass.'
+        : 'This is not the last batch: run only the focused tests of these tasks (their evidence: commands). The full suite runs in the last batch.',
+    )
   if (p.wave)
     lines.push(
       '',

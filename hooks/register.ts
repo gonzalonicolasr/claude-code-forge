@@ -65,7 +65,7 @@ import type { Phase, Verdict, Mode, RunStatus, Effort, Decision, Outcome, WaveRe
 import { PHASE_PROMPTS, briefFor, startInstruction, nextInstruction, finalInstruction, waveChildInstruction, extraCallDenial, NODD_HINT } from './prompts.ts'
 
 const PANE = 'forge'
-export const VERSION = '0.4.2'
+export const VERSION = '0.4.3'
 const CPAM = 'http://127.0.0.1:8317'
 const C = {
   violet: '#8b5cf6',
@@ -239,6 +239,8 @@ let asking = false
 let stateDirReady = false
 let endedSid = ''
 const agentPhase = new Map<string, Phase | null>()
+// Agentes de fase cuyo cierre ya tomó forge: su aviso de fin (task-notification) no abre un turno del modelo principal.
+const closedAgents = new Set<string>()
 const answers = new Map<string, string>()
 const stepTexts = new Map<string, string[]>()
 const handbacks = new Map<string, string>()
@@ -1818,6 +1820,13 @@ export function register(on: any) {
   })
 
   on('prompt.submit', async ($: any, e: any, next: any) => {
+    // Una fase en segundo plano avisa al terminar y ese aviso abría un turno del modelo principal antes de la
+    // instrucción de forge: dos turnos por fase (y el informe entero de la fase en el contexto principal).
+    if (!headless && e.origin?.kind === 'task-notification') {
+      const note = String(e.text || '')
+      const id = /<task-id>([^<]+)<\/task-id>/.exec(note)?.[1]
+      if (id && /<status>completed<\/status>/.test(note) && (closedAgents.has(id) || (run?.status === 'running' && !!run.flights[id]))) return { drop: 'forge: sigue con la instrucción de forge' }
+    }
     const m = /^\s*\/forge(?:\s+([\s\S]*))?$/.exec(String(e.text || ''))
     if (!m || !headless) return next(e)
     const args = String(m[1] || '').trim()
@@ -2078,6 +2087,7 @@ export function register(on: any) {
         answers.set(e.agentId, String(e.answer || ''))
         const flight = run?.flights[e.agentId]
         if (run && run.status === 'running' && flight) {
+          closedAgents.add(e.agentId)
           if (flight.task && run.unit?.parallel && run.unit.tasks.includes(flight.task)) {
             const done = await childDone($, e.agentId, run.unit, flight.task, childResult(e.agentId, [{ type: 'text', text: String(e.answer || '') }]))
             if (done.closed) submitLater($, done.text)
